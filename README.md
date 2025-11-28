@@ -1,6 +1,6 @@
 ## ESP32 GRBL Joystick Controller man in the middle
 Ein ESP32-S3 Projekt zur Steuerung eines GRBL-gesteuerten CNC-Systems über einen analogen Joystick. Das Projekt nutzt den ESP32-S3 USB Host, UART und ADC für die Kommunikation und Eingabe.
-Das ganze wird als USB-USB Bridge verwendet.
+Das ganze wird als USB<->USB Bridge verwendet.
 
 ## Features
 USB CDC-ACM Kommunikation mit GRBL-Geräten

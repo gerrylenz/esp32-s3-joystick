@@ -1,0 +1,30 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.espIdfPath": "/home/gerry/esp/v5.5.1/esp-idf",
+  "idf.toolsPath": "/home/gerry/.espressif",
+  "idf.pythonInstallPath": "C:\\Users\\gerry\\.espressif\\tools\\idf-python\\3.11.2\\python.exe",
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "clangd.path": "/home/gerry/.espressif/tools/esp-clang/esp-19.1.2_20250312/esp-clang/bin/clangd",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=/home/gerry/.espressif/tools/xtensa-esp-elf/esp-14.2.0_20241119/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc",
+    "--compile-commands-dir=/home/gerry/Projekte/cdc_acm_vcp/build"
+  ],
+  "idf.port": "/dev/ttyACM0",
+  "idf.flashType": "UART",
+  "idf.portWin": "COM3",
+  "files.associations": {
+    "chrono": "cpp",
+    "format": "cpp",
+    "usb_types_ch9.h": "c",
+    "cdc_acm_host.h": "c",
+    "cdc_host_common.h": "c",
+    "vcp_cp210x.h": "c",
+    "esp_check.h": "c"
+  }
+}

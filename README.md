@@ -14,7 +14,7 @@ Blau: Gerät verbunden
 Rot: Gerät getrennt
 
 ## Hardware Requirements
-ESP32-S3 Dev Board (z. B. ESP32-S2 devkit)
+ESP32-S3 Dev Board (z. B. ESP32-S3 devkit)
 USB-Gerät kompatibel mit CDC-ACM (LPC17xx smoothiboard)
 Analoger Joystick (X/Y-Achsen)
 Optional: WS2812B LED-Strip

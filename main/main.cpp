@@ -1032,7 +1032,7 @@ static void usb_connect_loop(void *arg)
 // Main
 extern "C" void app_main()
 {
-    esp_log_level_set("*", ESP_LOG_DEBUG);
+    esp_log_level_set("*", ESP_LOG_NONE);
     uart_init();
 
     led_strip_init();

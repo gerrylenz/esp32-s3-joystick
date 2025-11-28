@@ -934,7 +934,7 @@ static void joy_task(void *arg)
         if (F > machine.maxFeedRate)
             F = machine.maxFeedRate;
 
-        if (F < 0.5f)
+        if (F < 500.0f)
             F = 500; // Minimum Feedrate
 
         start_jogging();

@@ -13,13 +13,13 @@ Blau: Gerät verbunden
 Rot: Gerät getrennt
 
 ## Hardware Requirements
-ESP32 Dev Board (z. B. ESP32-WROOM-32)
-USB-Gerät kompatibel mit CDC-ACM (GRBL-Controller)
+ESP32-S3 Dev Board (z. B. ESP32-S2 devkit)
+USB-Gerät kompatibel mit CDC-ACM (LPC17xx smoothiboard)
 Analoger Joystick (X/Y-Achsen)
 Optional: WS2812B LED-Strip
 
 ## Pin Configuration
-Signal	ESP32 Pin
+Signal	ESP32-S3 Pin
 UART0 TX	43
 UART0 RX	44
 UART1 TX	17
@@ -30,7 +30,6 @@ Joystick Y (ADC)	GPIO ADC3
 Hinweis: ADC-Kanäle werden auf 12 Bit aufgelöst.
 
 ## Software Requirements
-
 ESP-IDF v5.x
 FreeRTOS (inklusive ESP-IDF)
 USB Host Stack für ESP32
@@ -42,7 +41,6 @@ ESP-IDF einrichten und Toolchain installieren:
 ESP-IDF Getting Started Guide
 
 ## Projekt klonen:
-
 git clone https://github.com/deinusername/esp32-grbl-joystick.git
 cd esp32-grbl-joystick
 

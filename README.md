@@ -79,5 +79,4 @@ Maximalgeschwindigkeit für Jogging wird aus der GRBL-Konfiguration gelesen.
 USB CDC-ACM wird über Blocksendung (data_tx_blocking) verwendet, um Datenverlust zu vermeiden.
 
 License
-
-MIT License © [Dein Name]
+free to use @ your own risk

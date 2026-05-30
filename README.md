@@ -110,13 +110,14 @@ Achsen-Invertierung in `configure_joy()`: `joystick.xHardwareReversed`, `joystic
 | `joy_task()` | Joystick lesen, Jog-Befehle erzeugen |
 | `on_usb_connected()` | `$$` senden und GRBL-Settings laden |
 | `adc_init()` / `adc_read()` | ADC-Konfiguration und Joystick-Lesen |
-| `grbl_parse_config()` | GRBL-`$-Zeilen parsen |
+| `apply_grbl_max_feed()` | `$110` aus Config-Puffer lesen |
 | `led_control.cpp` | WS2812-Status-LED |
 
 ## Notes
 
 - Maximalgeschwindigkeit für Jogging wird aus der GRBL-Konfiguration (`$110`) gelesen; bis dahin gilt der Fallback `JOYSTICK_DEFAULT_MAX_FEED`.
 - USB CDC-ACM nutzt blockierendes Senden (`cdc_acm_host_data_tx_blocking`), um Datenverlust zu vermeiden.
+- Bei USB-TX-Fehler, CDC-Fehler oder Disconnect: Jog-Stopp, Queue leeren, Gerät schließen und automatischer Reconnect (500 ms Pause).
 - Logs erscheinen auf UART1 (115200 Baud), nicht auf UART0 — UART0 ist für die Host-Bridge reserviert.
 
 ## License

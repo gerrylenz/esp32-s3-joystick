@@ -34,10 +34,3 @@ void led_set_color(uint8_t r, uint8_t g, uint8_t b)
     led_strip_set_pixel(led_strip, 0, r, g, b);
     led_strip_refresh(led_strip);
 }
-
-void led_flash(uint8_t r, uint8_t g, uint8_t b, int ms)
-{
-    led_set_color(r, g, b);
-    vTaskDelay(pdMS_TO_TICKS(ms));
-    led_set_color(0, 0, 0);
-}

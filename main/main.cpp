@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <string.h>
-#include <memory>
 #include <cmath>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -17,10 +16,6 @@
 
 #include "esp_timer.h"
 #include "esp_adc/adc_oneshot.h"
-
-#ifndef MIN
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-#endif
 
 // UART-Konfiguration
 #define UART_NUM UART_NUM_0
@@ -58,7 +53,6 @@ typedef struct
 //**************************************************************************
 // ADC Konfiguration für Joystick (ADC2, Kanäle 2/3)
 #define ADC_UNIT ADC_UNIT_2
-#define ADC_ATTEN ADC_ATTEN_DB_12
 #define joystick_X_Pin ADC_CHANNEL_2
 #define joystick_Y_Pin ADC_CHANNEL_3
 
@@ -80,14 +74,8 @@ static bool filter_jog_ok = false;
 static bool next_jog_true = false;
 static int64_t jog_filter_until_us = 0; // Zeitmarke in µs
 
-int x = 0, y = 0, percent = 0;
-
-// Maschinen-Konfiguration
-struct machine_t
-{
-    char jogUnit[128]; // Jogging unit "G21" for mm or "G20" for inches.
-    float maxFeedRate; // Setting up the value of maximum feedrate the machine will go with when the joystick is fully pushed a side for jogging.
-} machine;
+int x = 0, y = 0;
+static float machine_max_feed_rate = JOYSTICK_DEFAULT_MAX_FEED;
 
 // Joystick-Konfiguration
 struct joystick_t
@@ -107,21 +95,6 @@ typedef struct
     char lines[GRBL_MAX_CONFIG_LINES][GRBL_MAX_LINE_LEN];
     int count;
 } grbl_config_t;
-
-// GRBL Settings Struktur
-typedef struct
-{
-    float steps_per_mm[3];    // $100, $101, $102
-    float max_rate[3];        // $110, $111, $112
-    float accel[3];           // $120, $121, $122
-    float max_travel[3];      // $130, $131, $132
-    float junction_deviation; // $11
-    float arc_tolerance;      // $12
-    float idle_lock_time;     // $1
-    int invert_mask;          // $3
-    int step_pulse_us;        // $0
-    float feed_rate;          // letzter bekannter Feed (optional)
-} grbl_settings_t;
 
 grbl_config_t raw_cfg;
 
@@ -183,7 +156,7 @@ static inline bool parse_grbl_pair(const char *line, int *index, float *value)
 }
 //*************************************************************************************
 // GRBL Konfigurationszeile hinzufügen
-void grbl_config_add_line(grbl_config_t *cfg, const char *line)
+static void grbl_config_add_line(grbl_config_t *cfg, const char *line)
 {
     if (cfg->count >= GRBL_MAX_CONFIG_LINES)
         return;
@@ -192,89 +165,28 @@ void grbl_config_add_line(grbl_config_t *cfg, const char *line)
     cfg->lines[cfg->count][GRBL_MAX_LINE_LEN - 1] = 0;
     cfg->count++;
 }
-//******************************************************************************************
-// GRBL Config parsen
-void grbl_parse_config(grbl_config_t *cfg, grbl_settings_t *out)
+
+static float grbl_max_feed_from_config(const grbl_config_t *cfg)
 {
-    memset(out, 0, sizeof(*out));
+    float max_feed = 0.0f;
 
     for (int i = 0; i < cfg->count; i++)
     {
-        char *line = cfg->lines[i];
-
         int idx;
         float val;
 
-        if (!parse_grbl_pair(line, &idx, &val))
-            continue;
-
-        switch (idx)
-        {
-        case 0:
-            out->step_pulse_us = (int)val;
-            break;
-        case 1:
-            out->idle_lock_time = val;
-            break;
-        case 3:
-            out->invert_mask = (int)val;
-            break;
-
-        case 11:
-            out->junction_deviation = val;
-            break;
-        case 12:
-            out->arc_tolerance = val;
-            break;
-
-        // Steps/mm
-        case 100:
-            out->steps_per_mm[0] = val;
-            break;
-        case 101:
-            out->steps_per_mm[1] = val;
-            break;
-        case 102:
-            out->steps_per_mm[2] = val;
-            break;
-
-        // Max feed rate
-        case 110:
-            out->max_rate[0] = val;
-            break;
-        case 111:
-            out->max_rate[1] = val;
-            break;
-        case 112:
-            out->max_rate[2] = val;
-            break;
-
-        // Acceleration
-        case 120:
-            out->accel[0] = val;
-            break;
-        case 121:
-            out->accel[1] = val;
-            break;
-        case 122:
-            out->accel[2] = val;
-            break;
-
-        // Travel limits
-        case 130:
-            out->max_travel[0] = val;
-            break;
-        case 131:
-            out->max_travel[1] = val;
-            break;
-        case 132:
-            out->max_travel[2] = val;
-            break;
-
-        default:
-            break; // alles andere ignorieren
-        }
+        if (parse_grbl_pair(cfg->lines[i], &idx, &val) && idx == 110)
+            max_feed = val;
     }
+
+    return max_feed;
+}
+
+static void apply_grbl_max_feed(const grbl_config_t *cfg)
+{
+    float feed = grbl_max_feed_from_config(cfg);
+    if (feed > 0.0f)
+        machine_max_feed_rate = feed;
 }
 //******************************************************************************************
 // UART Initialisierung & Event Task
@@ -518,14 +430,10 @@ void process_usb_rx_task(void *pvParameters)
                     if (line_buf[0] == '$')
                     {
                         grbl_config_add_line(&raw_cfg, line_buf);
-                        // Konfiguration jetzt parsen
-                        grbl_settings_t settings;
-                        grbl_parse_config(&raw_cfg, &settings);
-                        machine.maxFeedRate = settings.max_rate[0]; // X-Achse als Referenz
+                        apply_grbl_max_feed(&raw_cfg);
 
-                        // optional Log
                         ESP_LOGI("usb_rx", "GRBL $-Zeile empfangen: %s", line_buf);
-                        ESP_LOGI("grbl", "FeedMax: X=%.3f", machine.maxFeedRate);
+                        ESP_LOGI("grbl", "FeedMax: X=%.3f", machine_max_feed_rate);
                     }
 
                     // --------------------------
@@ -538,6 +446,30 @@ void process_usb_rx_task(void *pvParameters)
         }
     }
 }
+//******************************************************************************************
+static void usb_close_device(void)
+{
+    xSemaphoreTake(usb_tx_lock, portMAX_DELAY);
+    if (cdc_dev)
+    {
+        cdc_acm_host_close(cdc_dev);
+        cdc_dev = NULL;
+    }
+    xSemaphoreGive(usb_tx_lock);
+}
+
+static void recover_usb_link(const char *context, esp_err_t err)
+{
+    ESP_LOGW("usb_recovery", "%s: %s", context, esp_err_to_name(err));
+
+    stop_jogging();
+    if (tx_usb_queue)
+        xQueueReset(tx_usb_queue);
+
+    usb_close_device();
+    xSemaphoreGive(device_disconnected_sem);
+}
+
 //******************************************************************************************
 // Queue -> USB Task
 static void queue2grbl(void *arg)
@@ -552,12 +484,17 @@ static void queue2grbl(void *arg)
         // STOP bytes mit höherer Priorität (nicht blockierend prüfen)
         if (xQueueReceive(control_queue, &ctrl, 0) == pdPASS)
         {
-            xSemaphoreTake(usb_tx_lock, portMAX_DELAY);
             if (cdc_dev)
             {
-                cdc_acm_host_data_tx_blocking(cdc_dev, &ctrl, 1, 1000);
+                xSemaphoreTake(usb_tx_lock, portMAX_DELAY);
+                esp_err_t err = cdc_acm_host_data_tx_blocking(cdc_dev, &ctrl, 1, 1000);
+                xSemaphoreGive(usb_tx_lock);
+                if (err != ESP_OK)
+                {
+                    recover_usb_link("STOP send", err);
+                    continue;
+                }
             }
-            xSemaphoreGive(usb_tx_lock);
             ESP_LOGI("queue2grbl", "STOP sofort gesendet");
             xQueueReset(tx_usb_queue);
             continue;
@@ -571,24 +508,21 @@ static void queue2grbl(void *arg)
         if (len == 0)
             continue;
 
+        if (!cdc_dev)
+            continue;
+
         xSemaphoreTake(usb_tx_lock, portMAX_DELAY);
-        // nur zum loggen --------------------------------
 
         char tmp[MAX_LINE_LENGTH + 1];
         memcpy(tmp, item.data, item.len);
         tmp[item.len] = 0;
         ESP_LOGI("queue2grbl", "%s", tmp);
 
-        if (cdc_dev)
-        {
-            esp_err_t err = cdc_acm_host_data_tx_blocking(cdc_dev, (uint8_t *)item.data, item.len, 1000);
-            if (err != ESP_OK)
-            {
-                ESP_LOGI("queue2grbl", "Sendefehler (err=%d)", err);
-                break;
-            }
-        }
+        esp_err_t err = cdc_acm_host_data_tx_blocking(cdc_dev, (uint8_t *)item.data, item.len, 1000);
         xSemaphoreGive(usb_tx_lock);
+
+        if (err != ESP_OK)
+            recover_usb_link("TX send", err);
     }
 }
 //*************************************************************************************
@@ -599,13 +533,25 @@ static void handle_event(const cdc_acm_host_dev_event_data_t *event, void *user_
     {
     case CDC_ACM_HOST_ERROR:
         ESP_LOGE("handle_event", "CDC-ACM error has occurred, err_no = %i", event->data.error);
+        recover_usb_link("CDC-ACM error", ESP_FAIL);
         break;
     case CDC_ACM_HOST_DEVICE_DISCONNECTED:
         ESP_LOGI("handle_event", "Device suddenly disconnected");
-        ESP_ERROR_CHECK(cdc_acm_host_close(event->data.cdc_hdl));
-        xSemaphoreGive(device_disconnected_sem);
+        if (cdc_dev == event->data.cdc_hdl)
+        {
+            cdc_acm_host_close(event->data.cdc_hdl);
+            cdc_dev = NULL;
+        }
+        else if (event->data.cdc_hdl)
+        {
+            cdc_acm_host_close(event->data.cdc_hdl);
+        }
+        stop_jogging();
+        if (tx_usb_queue)
+            xQueueReset(tx_usb_queue);
         if (rx_usb_queue)
             xQueueReset(rx_usb_queue);
+        xSemaphoreGive(device_disconnected_sem);
         break;
     case CDC_ACM_HOST_SERIAL_STATE:
         // ESP_LOGI("handle_event", "Serial state notif 0x%04X", event->data.serial_state.val);
@@ -668,7 +614,7 @@ static void adc_read(void)
 }
 //******************************************************************************************
 // USB Connected Callback
-void on_usb_connected()
+static bool on_usb_connected(void)
 {
     ESP_LOGI("usb", "Starte GRBL Config Abfrage");
 
@@ -681,8 +627,9 @@ void on_usb_connected()
     esp_err_t err = cdc_acm_host_data_tx_blocking(cdc_dev, (uint8_t *)"$$\n", 3, 1000);
     if (err != ESP_OK)
     {
-        ESP_LOGW("on_usb_connected", "Sendefehler $$");
-        return;
+        ESP_LOGW("on_usb_connected", "Sendefehler $$: %s", esp_err_to_name(err));
+        grbl_config_active = false;
+        return false;
     }
 
     // Warten bis GRBL alles geschickt hat
@@ -696,24 +643,15 @@ void on_usb_connected()
     if (!grbl_config_done)
     {
         ESP_LOGW("grbl", "GRBL Konfiguration TIMEOUT");
-        return;
+        grbl_config_active = false;
+        return false;
     }
 
-    // Konfiguration jetzt parsen
-    grbl_settings_t settings;
-    grbl_parse_config(&raw_cfg, &settings);
-
-    machine.maxFeedRate = settings.max_rate[0]; // X-Achse als Referenz
+    apply_grbl_max_feed(&raw_cfg);
 
     ESP_LOGI("grbl", "Konfiguration erfolgreich geladen");
-    ESP_LOGI("grbl", "FeedMax: X=%.3f  Y=%.3f  Z=%.3f",
-             settings.max_rate[0],
-             settings.max_rate[1],
-             settings.max_rate[2]);
-    ESP_LOGI("grbl", "Steps/mm: X=%.3f  Y=%.3f  Z=%.3f",
-             settings.steps_per_mm[0],
-             settings.steps_per_mm[1],
-             settings.steps_per_mm[2]);
+    ESP_LOGI("grbl", "FeedMax X=%.3f", machine_max_feed_rate);
+    return true;
 }
 //******************************************************************************************
 // Joystick Normalisierung & Quantisierung
@@ -722,8 +660,7 @@ static void configure_joy(void)
     joystick.xHardwareReversed = true;
     joystick.yHardwareReversed = false;
 
-    strcpy(machine.jogUnit, "G21");
-    machine.maxFeedRate = JOYSTICK_DEFAULT_MAX_FEED;
+    machine_max_feed_rate = JOYSTICK_DEFAULT_MAX_FEED;
     adc_read();
 }
 //******************************************************************************************
@@ -795,7 +732,7 @@ static void joy_task(void *arg)
         }
 
         // --- Achsgeschwindigkeit (mm/s) ---
-        float max_mm_s = machine.maxFeedRate / 60.0f;
+        float max_mm_s = machine_max_feed_rate / 60.0f;
         float vx = sx * max_mm_s;
         float vy = sy * max_mm_s;
 
@@ -810,8 +747,8 @@ static void joy_task(void *arg)
         float Fy = (fabsf(send_y) / interval_s) * 60.0f;
         F = fmaxf(Fx, Fy);
 
-        if (F > machine.maxFeedRate)
-            F = machine.maxFeedRate;
+        if (F > machine_max_feed_rate)
+            F = machine_max_feed_rate;
 
         if (F < JOYSTICK_MIN_FEEDRATE)
             F = JOYSTICK_MIN_FEEDRATE;
@@ -889,7 +826,14 @@ static void usb_connect_loop(void *arg)
 
         ESP_LOGI("usb_connect_loop", "USB-Gerät verbunden");
         led_set_color(0, 0, 255); // Blau = Gerät verbunden
-        on_usb_connected();
+
+        if (!on_usb_connected())
+        {
+            led_set_color(255, 0, 0);
+            usb_close_device();
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
 
         // Control-Line-Reset für GRBL-Gerät
         cdc_acm_host_set_control_line_state(cdc_dev, true, true);
@@ -899,9 +843,13 @@ static void usb_connect_loop(void *arg)
 
         // Warte bis Gerät getrennt wird
         xSemaphoreTake(device_disconnected_sem, portMAX_DELAY);
-        cdc_dev = NULL;
+        stop_jogging();
+        if (tx_usb_queue)
+            xQueueReset(tx_usb_queue);
         led_set_color(255, 0, 0); // Rot = Gerät getrennt
-        ESP_LOGW("usb_connect_loop", "USB-Gerät getrennt");
+        ESP_LOGW("usb_connect_loop", "USB-Gerät getrennt — Reconnect in 500ms");
+        cdc_dev = NULL;
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 //******************************************************************************************

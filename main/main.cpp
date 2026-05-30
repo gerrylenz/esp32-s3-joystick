@@ -17,7 +17,6 @@
 
 #include "esp_timer.h"
 #include "esp_adc/adc_oneshot.h"
-#include "esp_adc/adc_cali.h"
 
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -39,6 +38,10 @@ const int UART_BUF_SIZE = 1024;
 #define MAX_LINE_LENGTH 128
 #define USB_MAX_CHUNK 128
 
+// Smoothieboard (LPC17xx) CDC-ACM — VID/PID ggf. anpassen
+#define USB_TARGET_VID 0xFFFF
+#define USB_TARGET_PID 0x0005
+
 #define RX_QUEUE_LENGTH 64
 #define RX_ITEM_SIZE 128
 
@@ -53,8 +56,7 @@ typedef struct
 } rx_packet_t;
 
 //**************************************************************************
-// ADC Konfiguration für Joystick
-// ADC1 Kanäle für X- und Y-Achse
+// ADC Konfiguration für Joystick (ADC2, Kanäle 2/3)
 #define ADC_UNIT ADC_UNIT_2
 #define ADC_ATTEN ADC_ATTEN_DB_12
 #define joystick_X_Pin ADC_CHANNEL_2
@@ -63,15 +65,14 @@ typedef struct
 adc_channel_t channels[2] = {joystick_X_Pin, joystick_Y_Pin};
 adc_oneshot_unit_handle_t adc_handle;
 static int adc_raw[2];
-static int voltage[2];
-
-// ADC Kalibrierungs-Handles
-adc_cali_handle_t adc_cali_chan0_handle = NULL;
-adc_cali_handle_t adc_cali_chan1_handle = NULL;
-static bool adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle);
 
 //**************************************************************************
 // Joystick & Jogging Variablen
+#define JOYSTICK_DEADZONE 20       // auf Skala -100..+100 (≈10 % des Wegs)
+#define JOYSTICK_MIN_FEEDRATE 500.0f // mm/min
+#define JOYSTICK_STEP_MM 0.1f      // Schrittweite pro Jog-Befehl
+#define JOYSTICK_DEFAULT_MAX_FEED 4000.0f // Fallback bis GRBL-Config geladen
+
 // --- Stop-Befehl definieren ---
 #define GRBL_STOP_CMD 0x85
 static bool is_jogging_now = false;
@@ -637,11 +638,11 @@ int map(int x, int in_min, int in_max, int out_min, int out_max)
     return ((x - in_min) * (out_max - out_min)) / (in_max - in_min) + out_min;
 }
 //*************************************************************************************
-// ADC Initialisierung & Kalibrierung
+// ADC Initialisierung
 void adc_init(adc_channel_t *channel, uint8_t numChannels)
 {
     adc_oneshot_unit_init_cfg_t unitConfig = {
-        .unit_id = ADC_UNIT, // ADC1
+        .unit_id = ADC_UNIT,
     };
     adc_oneshot_new_unit(&unitConfig, &adc_handle);
 
@@ -655,137 +656,15 @@ void adc_init(adc_channel_t *channel, uint8_t numChannels)
         adc_oneshot_config_channel(adc_handle, channel[i], &channelConfig);
     }
 
-    //-------------ADC1 Calibration Init---------------//
-
-    adc_calibration_init(ADC_UNIT, channels[0], ADC_ATTEN_DB_12, &adc_cali_chan0_handle);
-    adc_calibration_init(ADC_UNIT, channels[1], ADC_ATTEN_DB_12, &adc_cali_chan1_handle);
-}
-//*************************************************************************************
-// ADC Calibration
-static bool adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle)
-{
-    adc_cali_handle_t handle = NULL;
-    esp_err_t ret = ESP_FAIL;
-    bool calibrated = false;
-
-#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
-    if (!calibrated)
-    {
-        ESP_LOGI("adc_calibration_init", "scheme version is %s", "Curve Fitting");
-        adc_cali_curve_fitting_config_t cali_config = {
-            .unit_id = unit,
-            .chan = channel,
-            .atten = atten,
-            .bitwidth = ADC_BITWIDTH_DEFAULT,
-        };
-        ret = adc_cali_create_scheme_curve_fitting(&cali_config, &handle);
-        if (ret == ESP_OK)
-        {
-            calibrated = true;
-        }
-    }
-#endif
-
-#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
-    if (!calibrated)
-    {
-        ESP_LOGI(TAG, "calibration scheme version is %s", "Line Fitting");
-        adc_cali_line_fitting_config_t cali_config = {
-            .unit_id = unit,
-            .atten = atten,
-            .bitwidth = ADC_BITWIDTH_DEFAULT,
-        };
-        ret = adc_cali_create_scheme_line_fitting(&cali_config, &handle);
-        if (ret == ESP_OK)
-        {
-            calibrated = true;
-        }
-    }
-#endif
-
-    *out_handle = handle;
-    if (ret == ESP_OK)
-    {
-        ESP_LOGI("adc_calibration_init", "Calibration Success");
-    }
-    else if (ret == ESP_ERR_NOT_SUPPORTED || !calibrated)
-    {
-        ESP_LOGW("adc_calibration_init", "eFuse not burnt, skip software calibration");
-    }
-    else
-    {
-        ESP_LOGE("adc_calibration_init", "Invalid arg or no memory");
-    }
-
-    return calibrated;
 }
 //*************************************************************************************
 static void adc_read(void)
 {
-
-    adc_oneshot_read(adc_handle, channels[0], &adc_raw[0]); // read channel 0
-    adc_cali_raw_to_voltage(adc_cali_chan0_handle, adc_raw[0], &voltage[0]);
-
-    adc_oneshot_read(adc_handle, channels[1], &adc_raw[1]); // read channel 1
-    adc_cali_raw_to_voltage(adc_cali_chan1_handle, adc_raw[1], &voltage[1]);
+    adc_oneshot_read(adc_handle, channels[0], &adc_raw[0]);
+    adc_oneshot_read(adc_handle, channels[1], &adc_raw[1]);
 
     x = map(adc_raw[0], 0, 4095, -100, 100);
     y = map(adc_raw[1], 0, 4095, -100, 100);
-}
-//*************************************************************************************
-// GRBL Config lesen
-bool grbl_read_config(grbl_config_t *cfg)
-{
-    cfg->count = 0;
-
-    // kleines Delay, GRBL muss bereit sein
-    vTaskDelay(pdMS_TO_TICKS(200));
-
-    // $$ senden
-    const char *cmd = "$$\n";
-    if (xQueueSend(tx_usb_queue, (void *)cmd, pdMS_TO_TICKS(50)) != pdPASS)
-        return false;
-
-    int64_t start = esp_timer_get_time();
-
-    while (true)
-    {
-        char rxline[128] = {0};
-
-        // 1 Sekunde Timeout insgesamt
-        if (esp_timer_get_time() - start > 1000000)
-        {
-            ESP_LOGW("grbl_cfg", "Timeout beim Lesen der GRBL-Konfiguration");
-            break;
-        }
-
-        // 100 ms auf neue Zeilen warten
-        if (xQueueReceive(rx_usb_queue, rxline, pdMS_TO_TICKS(100)) != pdPASS)
-            continue;
-
-        // nur Zeilen beachten, die mit '$' anfangen
-        if (rxline[0] != '$')
-            continue;
-
-        // "ok" bedeutet Ende
-        if (strncmp(rxline, "ok", 2) == 0)
-            break;
-
-        // Zeile speichern
-        if (cfg->count < 64)
-        {
-            strncpy(cfg->lines[cfg->count], rxline, 63);
-            cfg->count++;
-        }
-    }
-
-    if (cfg->count == 0)
-    {
-        ESP_LOGW("grbl_cfg", "Keine GRBL-Config empfangen.");
-        return false;
-    }
-
-    return true;
 }
 //******************************************************************************************
 // USB Connected Callback
@@ -844,14 +723,14 @@ static void configure_joy(void)
     joystick.yHardwareReversed = false;
 
     strcpy(machine.jogUnit, "G21");
-    machine.maxFeedRate = 4000;
+    machine.maxFeedRate = JOYSTICK_DEFAULT_MAX_FEED;
     adc_read();
 }
 //******************************************************************************************
 // --- 10-Stufen Quantisierung
 static float quantize_10(int v)
 {
-    if (v > -20 && v < 20) // Deadzone = 20
+    if (v > -JOYSTICK_DEADZONE && v < JOYSTICK_DEADZONE)
         return 0.0f;
 
     // in 10 Bereiche pro Seite teilen
@@ -871,7 +750,7 @@ static void joy_task(void *arg)
     // --- Konfiguration ---
     const TickType_t JOG_INTERVAL = pdMS_TO_TICKS(10); // 10 ms
     const TickType_t ADC_INTERVAL = pdMS_TO_TICKS(50); // ADC alle 50 ms
-    const float STEP_RES = 0.1f;                       // Schrittauflösung in mm
+    const float STEP_RES = JOYSTICK_STEP_MM;
 
     float send_x = 0;
     float send_y = 0;
@@ -898,7 +777,7 @@ static void joy_task(void *arg)
             ly = joystick.yHardwareReversed ? -y : y;
         }
 
-        // --- Quantisierung 11 Stufen ---
+        // --- Quantisierung 10 Stufen ---
         float sx = quantize_10(lx);
         float sy = quantize_10(ly);
 
@@ -934,8 +813,8 @@ static void joy_task(void *arg)
         if (F > machine.maxFeedRate)
             F = machine.maxFeedRate;
 
-        if (F < 500.0f)
-            F = 500; // Minimum Feedrate
+        if (F < JOYSTICK_MIN_FEEDRATE)
+            F = JOYSTICK_MIN_FEEDRATE;
 
         start_jogging();
         if (!next_jog_true)
@@ -972,9 +851,6 @@ static void joy_task(void *arg)
 // USB Connect Loop
 static void usb_connect_loop(void *arg)
 {
-    const uint16_t VID = 0xFFFF; // anpassen
-    const uint16_t PID = 0x0005; // anpassen
-
     const cdc_acm_host_device_config_t dev_cfg = {
         .connection_timeout_ms = 5000,
         .out_buffer_size = USB_MAX_CHUNK,
@@ -986,7 +862,7 @@ static void usb_connect_loop(void *arg)
     while (true)
     {
         ESP_LOGI("usb_connect_loop", "Versuche USB-Gerät zu öffnen...");
-        esp_err_t err = cdc_acm_host_open(VID, PID, 0, &dev_cfg, &cdc_dev);
+        esp_err_t err = cdc_acm_host_open(USB_TARGET_VID, USB_TARGET_PID, 0, &dev_cfg, &cdc_dev);
 
         if (err != ESP_OK)
         {
@@ -1032,7 +908,6 @@ static void usb_connect_loop(void *arg)
 // Main
 extern "C" void app_main()
 {
-    esp_log_level_set("*", ESP_LOG_NONE);
     uart_init();
 
     led_strip_init();
@@ -1050,7 +925,6 @@ extern "C" void app_main()
     rx_usb_queue = xQueueCreate(RX_QUEUE_LENGTH, sizeof(rx_packet_t));
     assert(rx_usb_queue);
 
-    // tx_usb_queue = xQueueCreate(LINE_QUEUE_LENGTH, MAX_LINE_LENGTH);
     tx_usb_queue = xQueueCreate(LINE_QUEUE_LENGTH, sizeof(tx_item_t));
     assert(tx_usb_queue);
 

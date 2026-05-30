@@ -10,11 +10,11 @@ An ESP32-S3 firmware project for jogging a GRBL-controlled CNC machine with an a
 
 ```
                     ┌─────────────────────────────────────────────┐
-                    │              ESP32-S3 (grbl-joy)             │
+                    │              ESP32-S3 (grbl-joy)            │
                     │                                             │
   Host PC           │   UART0                         USB Host    │           GRBL controller
-  (CAM / sender)    │   GPIO 43 TX  ───────────────►  CDC-ACM    │◄────────► (Smoothieboard)
-       │            │   GPIO 44 RX  ◄───────────────             │    USB
+  (CAM / sender)    │   GPIO 43 TX  ───────────────►  CDC-ACM     │◄────────► (Smoothieboard)
+       │            │   GPIO 44 RX  ◄───────────────              │    USB
        │            │                                             │
        └────────────┼─────────────────────────────────────────────┘
          115200     │

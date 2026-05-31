@@ -1,0 +1,11 @@
+{
+  "clangd.arguments": [
+    "--compile-commands-dir=${workspaceFolder}/build",
+    "--query-driver=C:/Espressif/**/xtensa-esp*-elf-gcc*,C:/Espressif/**/xtensa-esp*-elf-g++"
+  ],
+  "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
+  "C_Cpp.intelliSenseEngine": "disabled",
+  "idf.currentSetup": "C:\\esp\\v6.0.1\\esp-idf",
+  "idf.portWin": "COM3",
+  "idf.flashType": "UART"
+}

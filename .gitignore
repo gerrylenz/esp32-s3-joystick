@@ -1,5 +1,35 @@
+# ESP-IDF build output
+/build/
+/managed_components/
+/dependencies/
 /dependencies.lock
-/build/*
-/.vscode/*
-/managed_components/*
-sdkconfig*
+
+# Local SDK config (defaults are tracked)
+/sdkconfig
+sdkconfig.old
+sdkconfig.old.*
+
+# IDE (machine-specific)
+.vscode/*
+!.vscode/c_cpp_properties.json
+!.vscode/settings.json.example
+
+.idea/
+*.code-workspace
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs & binaries
+*.log
+*.bin
+*.elf
+*.map

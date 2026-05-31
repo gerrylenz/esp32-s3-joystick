@@ -66,9 +66,9 @@ flowchart LR
 ## Features
 
 - UART↔USB bridge between host (UART0) and GRBL device (USB CDC-ACM)
-- Joystick-based jogging (`$J=G91 …`)
-- 10-step quantization per axis for smooth motion
-- Fixed joystick deadzone (±20 on a −100…+100 scale, ~10%)
+- Joystick-based jogging (`$J=G91 …`) with proportional speed and step size
+- Automatic joystick calibration at startup (center point and per-axis noise)
+- ADC-based start/stop hysteresis and adaptive center tracking while idle
 - Automatic GRBL configuration query (`$$`) after USB connection
 - Error detection (`ALARM`, `ERROR`) with automatic stop
 - Automatic reconnect on USB TX errors, CDC errors, or disconnect
@@ -96,6 +96,29 @@ flowchart LR
 | WS2812 LED | GPIO 48 | Status indicator |
 
 Note: Joystick ADC uses 12-bit resolution and 12 dB attenuation (`ADC_ATTEN_DB_12`).
+
+### Optional: UART0 hardware flow control (RTS/CTS)
+
+If the host sends G-code faster than GRBL can process it, enable hardware flow control so the ESP32 can pause the host before UART buffers overflow.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `UART0_FLOW_CONTROL` | `0` | Set to `1` to enable |
+| `UART0_RTS_PIN` | GPIO 21 | ESP32 RTS output → **host CTS** input |
+| `UART0_CTS_PIN` | NC | Optional: host RTS → ESP32 CTS |
+| `UART0_RX_FLOW_CTRL_THRESH` | 64 | HW FIFO fill level before RTS is asserted |
+
+Wiring (minimum):
+
+```
+ESP32-S3          Host (USB-UART adapter / PC)
+GPIO 43 TX   ──►  RX
+GPIO 44 RX   ◄──  TX
+GPIO 21 RTS  ──►  CTS        (only when UART0_FLOW_CONTROL = 1)
+GND          ──►  GND
+```
+
+The host side must respect CTS (most USB-serial adapters do when flow control is enabled in the driver). On Linux: `stty -F /dev/ttyUSB0 crtscts`.
 
 ## USB Device
 
@@ -149,13 +172,19 @@ idf.py flash monitor
 
 | Parameter | Value | Constant in `main.cpp` |
 |-----------|-------|------------------------|
-| Deadzone | ±20 (−100…+100) | `JOYSTICK_DEADZONE` |
-| Quantization | 10 steps per axis | `quantize_10()` |
-| Step size | 0.1 mm | `JOYSTICK_STEP_MM` |
-| Min. feed rate | 500 mm/min | `JOYSTICK_MIN_FEEDRATE` |
+| Software deadzone | ±22 (−100…+100) | `JOYSTICK_DEADZONE_STOP` |
+| Start hysteresis | ADC noise + 55 counts | `JOYSTICK_ADC_START_EXTRA` |
+| Stop hysteresis | ADC noise + 6 counts | `JOYSTICK_ADC_IDLE_MARGIN` |
+| Start confirmation | 4 × 10 ms | `JOYSTICK_START_SAMPLES` |
+| Min. jog step | 0.008 mm | `JOG_MIN_STEP_MM` |
+| Lookahead factor | 2.0 segments | `JOG_LOOKAHEAD_SEGMENTS` |
+| Min. feed rate | 1 mm/min | `JOYSTICK_MIN_FEEDRATE` |
 | Max. feed rate | from GRBL `$110`, fallback 4000 | `JOYSTICK_DEFAULT_MAX_FEED` |
-| Jog interval | 10 ms | `JOG_INTERVAL` in `joy_task()` |
-| ADC sampling | 50 ms | `ADC_INTERVAL` in `joy_task()` |
+| Jog / ADC interval | 10 ms | `JOG_INTERVAL` in `joy_task()` |
+| Center calibration | 64 samples at boot | `JOYSTICK_CENTER_SAMPLES` |
+| Center drift correction | after ~400 ms idle | `JOYSTICK_CENTER_TRACK_SAMPLES` |
+
+Jog commands use `$J=G91 X.. Y.. F..` with step size and feed rate derived from joystick deflection and `$110`. Each command is sent only after GRBL responds with `ok` (`ok_sem`).
 
 Axis inversion in `configure_joy()`: `joystick.xHardwareReversed`, `joystick.yHardwareReversed`.
 
@@ -169,7 +198,8 @@ Axis inversion in `configure_joy()`: `joystick.xHardwareReversed`, `joystick.yHa
 | `uart_event_task()` | UART0 → TX queue (host → GRBL) |
 | `process_usb_rx_task()` | Parse USB RX, filter jog/errors, forward to UART0 |
 | `queue2grbl()` | Send TX queue and stop bytes to GRBL |
-| `joy_task()` | Read joystick, generate jog commands |
+| `joy_task()` | Read joystick, generate proportional jog commands |
+| `calibrate_joystick_center()` | Measure center and noise at startup |
 | `on_usb_connected()` | Send `$$` and load GRBL settings |
 | `recover_usb_link()` | Stop jog, clear queues, close device, trigger reconnect |
 | `adc_init()` / `adc_read()` | ADC setup and joystick reading |
@@ -182,6 +212,8 @@ Axis inversion in `configure_joy()`: `joystick.xHardwareReversed`, `joystick.yHa
 - USB CDC-ACM uses blocking transmit (`cdc_acm_host_data_tx_blocking`) to reduce data loss.
 - On USB TX failure, CDC error, or disconnect: stop jogging, clear queues, close the device, reconnect after 500 ms.
 - Logs go to UART1 (115200 baud), not UART0 — UART0 is reserved for the host bridge.
+- TX queue backpressure: host data waits on `tx_usb_queue`; overflow counters are logged as warnings (`tx_queue_*`, `uart_rx_overflow_count`).
+- For sustained high host throughput, enable `UART0_FLOW_CONTROL` (see above).
 
 ## License
 

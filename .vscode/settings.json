@@ -26,5 +26,6 @@
     "cdc_host_common.h": "c",
     "vcp_cp210x.h": "c",
     "esp_check.h": "c"
-  }
+  },
+  "idf.currentSetup": "C:\\esp\\v6.0.1\\esp-idf"
 }

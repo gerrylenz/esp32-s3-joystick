@@ -1,2 +1,5 @@
 CompileFlags:
-    Remove: [-f*, -m*]
+  CompilationDatabase: build
+  Add:
+    - -D__XTENSA__=1
+  Remove: [-f*, -m*]

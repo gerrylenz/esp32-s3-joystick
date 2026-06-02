@@ -1,5 +1,7 @@
 /dependencies.lock
 /build/*
 /.vscode/*
+!.vscode/settings.json
+!.vscode/c_cpp_properties.json
 /managed_components/*
 sdkconfig*

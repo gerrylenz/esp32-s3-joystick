@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <inttypes.h>
 #include <cmath>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -22,22 +23,36 @@
 #define UART0_TX_PIN 43
 #define UART0_RX_PIN 44
 #define BAUDRATE 115200
-const int UART_BUF_SIZE = 1024;
+#define UART_LOG_BUF_SIZE 1024
+#define UART_HOST_BUF_SIZE 2048
+#define UART_EVENT_QUEUE_LENGTH 40
+
+// Optional: UART0 hardware flow control (Host sendet nur, wenn ESP bereit ist)
+// Verkabelung: ESP32 RTS → Host CTS (GND gemeinsam). Host-Software muss CTS respektieren.
+// Auf 1 setzen und UART0_RTS_PIN an freien GPIO anpassen.
+#define UART0_FLOW_CONTROL 0
+#if UART0_FLOW_CONTROL
+#define UART0_RTS_PIN 21              // ESP32 RTS-Ausgang → Host CTS-Eingang
+#define UART0_CTS_PIN UART_PIN_NO_CHANGE // optional: Host RTS → ESP32 CTS (sonst NC)
+#define UART0_RX_FLOW_CTRL_THRESH 64  // HW-FIFO-Füllstand, ab dem RTS aktiv wird
+#endif
 
 #define UART_LOG_NUM UART_NUM_1
 #define UART_LOG_TX_PIN 17
 #define UART_LOG_RX_PIN 18
 
 // Queue-Definitionen
-#define LINE_QUEUE_LENGTH 10
+#define LINE_QUEUE_LENGTH 32
 #define MAX_LINE_LENGTH 128
 #define USB_MAX_CHUNK 128
+#define USB_CDC_IN_BUFFER_SIZE 128
+#define TX_QUEUE_SEND_TIMEOUT_MS 500
 
 // Smoothieboard (LPC17xx) CDC-ACM — VID/PID ggf. anpassen
 #define USB_TARGET_VID 0xFFFF
 #define USB_TARGET_PID 0x0005
 
-#define RX_QUEUE_LENGTH 64
+#define RX_QUEUE_LENGTH 128
 #define RX_ITEM_SIZE 128
 
 // USB CDC Device Handle
@@ -62,9 +77,21 @@ static int adc_raw[2];
 
 //**************************************************************************
 // Joystick & Jogging Variablen
-#define JOYSTICK_DEADZONE 20       // auf Skala -100..+100 (≈10 % des Wegs)
-#define JOYSTICK_MIN_FEEDRATE 500.0f // mm/min
-#define JOYSTICK_STEP_MM 0.1f      // Schrittweite pro Jog-Befehl
+#define JOYSTICK_DEADZONE_STOP 22    // Mitte pro Achse (Skala -100..100)
+#define JOYSTICK_START_SAMPLES 4     // n×10 ms bestätigen vor erstem Jog
+#define JOYSTICK_ADC_HALF_RANGE 1000
+#define JOYSTICK_NOISE_MARGIN 15
+#define JOYSTICK_X_NOISE_EXTRA 12    // X-Achse: oft mehr ADC-Offset
+#define JOYSTICK_ADC_IDLE_MARGIN 6   // Counts über Rausch → gilt als Ruhe
+#define JOYSTICK_ADC_START_EXTRA 55  // Counts über Rausch → Anfahren
+#define JOYSTICK_CENTER_TRACK_SAMPLES 40 // ~400 ms Ruhe → Nullpunkt nachführen
+#define JOYSTICK_TRAVEL_LEARN_MIN 350
+#define JOYSTICK_CENTER_SAMPLES 64
+#define JOYSTICK_MIN_FEEDRATE 1.0f
+#define JOYSTICK_RESPONSE_EXPONENT 1.6f // >1 = langsamer/feiner bei kleinem Ausschlag
+#define JOYSTICK_MOTION_SMOOTH_ALPHA 0.35f // 0..1, niedriger = weicher, träger
+#define JOG_LOOKAHEAD_SEGMENTS 2.5f
+#define JOG_MIN_STEP_MM 0.004f
 #define JOYSTICK_DEFAULT_MAX_FEED 4000.0f // Fallback bis GRBL-Config geladen
 
 // --- Stop-Befehl definieren ---
@@ -75,7 +102,15 @@ static bool next_jog_true = false;
 static int64_t jog_filter_until_us = 0; // Zeitmarke in µs
 
 int x = 0, y = 0;
+static int joystick_center_adc[2];
+static int adc_filtered[2];
+static int joystick_noise_adc[2] = {JOYSTICK_NOISE_MARGIN, JOYSTICK_NOISE_MARGIN};
+static int joystick_range_adc_pos[2] = {JOYSTICK_ADC_HALF_RANGE, JOYSTICK_ADC_HALF_RANGE};
+static int joystick_range_adc_neg[2] = {JOYSTICK_ADC_HALF_RANGE, JOYSTICK_ADC_HALF_RANGE};
+static bool joystick_calibrated = false;
 static float machine_max_feed_rate = JOYSTICK_DEFAULT_MAX_FEED;
+static float motion_smooth_x = 0.0f;
+static float motion_smooth_y = 0.0f;
 
 // Joystick-Konfiguration
 struct joystick_t
@@ -118,6 +153,12 @@ static QueueHandle_t control_queue; // für Stop/Notfall-Bytes
 
 #define CONTROL_QUEUE_LENGTH 8
 
+static volatile uint32_t tx_queue_host_timeout_count;
+static volatile uint32_t tx_queue_jog_drop_count;
+static volatile uint32_t tx_queue_reset_timeout_count;
+static volatile uint32_t rx_usb_queue_drop_count;
+static volatile uint32_t uart_rx_overflow_count;
+
 //******************************************************************************************
 // Joystick Start/Stop Funktionen
 static inline void start_jogging(void)
@@ -129,15 +170,49 @@ static inline void start_jogging(void)
 }
 static inline void stop_jogging(void)
 {
-    // Jogging beendet — aktiviere kurzzeitigen Filter für Nachlauf-ok
     is_jogging_now = false;
     next_jog_true = false;
     xSemaphoreTake(ok_sem, 0);
-    const int FILTER_MS = 1000; // Dauer, in der Nachschwinger-ok ignoriert werden
+    const int FILTER_MS = 1000;
     jog_filter_until_us = esp_timer_get_time() + (int64_t)FILTER_MS * 1000LL;
-    xSemaphoreGive(ok_sem);
     filter_jog_ok = true;
     next_jog_true = true;
+}
+
+static void send_jog_cancel(void)
+{
+    xQueueReset(tx_usb_queue);
+    xSemaphoreTake(ok_sem, 0);
+
+    uint8_t stop = GRBL_STOP_CMD;
+    if (cdc_dev == NULL)
+    {
+        xQueueSend(control_queue, &stop, 0);
+        xSemaphoreGive(ok_sem);
+        return;
+    }
+
+    xSemaphoreTake(usb_tx_lock, portMAX_DELAY);
+    esp_err_t err = cdc_acm_host_data_tx_blocking(cdc_dev, &stop, 1, 100);
+    xSemaphoreGive(usb_tx_lock);
+
+    if (err != ESP_OK)
+        xQueueSend(control_queue, &stop, 0);
+
+    xSemaphoreGive(ok_sem);
+}
+
+static inline void reset_motion_smoothing(void)
+{
+    motion_smooth_x = 0.0f;
+    motion_smooth_y = 0.0f;
+}
+
+static inline void abort_jog_motion(void)
+{
+    stop_jogging();
+    reset_motion_smoothing();
+    send_jog_cancel();
 }
 //******************************************************************************************
 // GRBL-Paar Parsing ($Index=Value)
@@ -146,7 +221,7 @@ static inline bool parse_grbl_pair(const char *line, int *index, float *value)
     if (line[0] != '$')
         return false;
 
-    char *eq = strchr(line, '=');
+    const char *eq = strchr(line, '=');
     if (!eq)
         return false;
 
@@ -197,25 +272,43 @@ static void uart_init()
     cfg.data_bits = UART_DATA_8_BITS;
     cfg.parity = UART_PARITY_DISABLE;
     cfg.stop_bits = UART_STOP_BITS_1;
+#if UART0_FLOW_CONTROL
+#if (UART0_CTS_PIN != UART_PIN_NO_CHANGE)
+    cfg.flow_ctrl = UART_HW_FLOWCTRL_CTS_RTS;
+#else
+    cfg.flow_ctrl = UART_HW_FLOWCTRL_RTS;
+#endif
+    cfg.rx_flow_ctrl_thresh = UART0_RX_FLOW_CTRL_THRESH;
+#else
     cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+#endif
     cfg.source_clk = UART_SCLK_DEFAULT;
 
     uart_param_config(UART_LOG_NUM, &cfg);
     uart_set_pin(UART_LOG_NUM, UART_LOG_TX_PIN, UART_LOG_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    uart_driver_install(UART_LOG_NUM, UART_BUF_SIZE, UART_BUF_SIZE, 0, NULL, 0);
+    uart_driver_install(UART_LOG_NUM, UART_LOG_BUF_SIZE, UART_LOG_BUF_SIZE, 0, NULL, 0);
 
     esp_err_t ret;
     ret = uart_param_config(UART_NUM, &cfg);
     if (ret != ESP_OK)
         ESP_LOGE("uart_init", "uart_param_config failed: %d", ret);
+#if UART0_FLOW_CONTROL
+    ret = uart_set_pin(UART_NUM, UART0_TX_PIN, UART0_RX_PIN, UART0_RTS_PIN, UART0_CTS_PIN);
+    if (ret != ESP_OK)
+        ESP_LOGE("uart_init", "uart_set_pin failed: %d", ret);
+    ESP_LOGI("uart_init", "UART0 HW flow control: RTS=GPIO %d, thresh=%d",
+             UART0_RTS_PIN, UART0_RX_FLOW_CTRL_THRESH);
+#else
     ret = uart_set_pin(UART_NUM, UART0_TX_PIN, UART0_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (ret != ESP_OK)
         ESP_LOGE("uart_init", "uart_set_pin failed: %d", ret);
-    ret = uart_driver_install(UART_NUM, UART_BUF_SIZE, UART_BUF_SIZE, 20, &rx_uart_queue, 0);
+#endif
+    ret = uart_driver_install(UART_NUM, UART_HOST_BUF_SIZE, UART_HOST_BUF_SIZE,
+                              UART_EVENT_QUEUE_LENGTH, &rx_uart_queue, 0);
     if (ret != ESP_OK)
         ESP_LOGE("uart_init", "uart_driver_install failed: %d", ret);
     else
-        ESP_LOGI("uart_init", "uart_driver_install OK");
+        ESP_LOGD("uart_init", "uart_driver_install OK");
     if (rx_uart_queue == NULL)
     {
         ESP_LOGE("uart_init", "uart_queue == NULL after driver install!");
@@ -248,35 +341,36 @@ static void uart_event_task(void *pvParameters)
                 if (r > 0)
                 {
                     item.len = (size_t)r;
-                    if (xQueueSend(tx_usb_queue, &item, pdMS_TO_TICKS(10)) != pdPASS)
+                    if (xQueueSend(tx_usb_queue, &item, portMAX_DELAY) != pdPASS)
                     {
-                        ESP_LOGW("uart_event_task", "tx_usb_queue voll, drop uart data");
+                        tx_queue_host_timeout_count++;
+                        ESP_LOGW("uart_event_task", "tx_usb_queue blockiert — Host-Daten verworfen");
                     }
                 }
                 break;
             }
             case UART_BREAK:
-                ESP_LOGI("uart_event_task", "UART RX break detected");
+                ESP_LOGD("uart_event_task", "UART RX break detected");
                 break;
 
             case UART_BUFFER_FULL:
-                ESP_LOGW("uart_event_task", "UART RX buffer full");
+                uart_rx_overflow_count++;
+                ESP_LOGW("uart_event_task", "UART RX buffer full (#%" PRIu32 ")", uart_rx_overflow_count);
                 uart_flush_input(UART_NUM);
-                xQueueReset(tx_usb_queue);
                 break;
 
             case UART_FIFO_OVF:
-                ESP_LOGW("uart_event_task", "UART RX FIFO overflow");
+                uart_rx_overflow_count++;
+                ESP_LOGW("uart_event_task", "UART RX FIFO overflow (#%" PRIu32 ")", uart_rx_overflow_count);
                 uart_flush_input(UART_NUM);
-                xQueueReset(tx_usb_queue);
                 break;
 
             case UART_FRAME_ERR:
-                ESP_LOGW("uart_event_task", "UART frame error");
+                ESP_LOGD("uart_event_task", "UART frame error");
                 break;
 
             case UART_PARITY_ERR:
-                ESP_LOGW("uart_event_task", "UART parity error");
+                ESP_LOGD("uart_event_task", "UART parity error");
                 break;
 
             case UART_PATTERN_DET:
@@ -305,7 +399,7 @@ static bool handle_usb_rx(const uint8_t *data, size_t len, void *arg)
     pkt.len = len;
 
     if (xQueueSendFromISR(rx_usb_queue, &pkt, NULL) != pdPASS)
-        ESP_LOGW("handle_usb_rx", "RX queue full, drop packet");
+        rx_usb_queue_drop_count++;
 
     return true;
 }
@@ -344,13 +438,7 @@ void process_usb_rx_task(void *pvParameters)
                         if (strstr(line_buf, "ALARM:") || strstr(line_buf, "ERROR:"))
                         {
                             stop_jogging();
-
-                            // Queue leeren
-                            xQueueReset(tx_usb_queue);
-
-                            // Optional: Stop-Befehl an GRBL senden
-                            uint8_t stop_cmd = GRBL_STOP_CMD;
-                            xQueueSend(control_queue, &stop_cmd, 0);
+                            send_jog_cancel();
 
                             // GRBL Reset senden ($X) nach kurzer Verzögerung
                             vTaskDelay(pdMS_TO_TICKS(50));
@@ -358,12 +446,15 @@ void process_usb_rx_task(void *pvParameters)
                             const char *reset_cmd = "$X\n";
                             reset_item.len = strlen(reset_cmd);
                             memcpy(reset_item.data, reset_cmd, reset_item.len);
-                            if (xQueueSend(tx_usb_queue, &reset_item, 0) != pdPASS)
+                            if (xQueueSend(tx_usb_queue, &reset_item,
+                                           pdMS_TO_TICKS(TX_QUEUE_SEND_TIMEOUT_MS)) != pdPASS)
                             {
-                                ESP_LOGI("usb_rx", "tx_usb_queue voll, Reset-Befehl verworfen");
+                                tx_queue_reset_timeout_count++;
+                                ESP_LOGW("usb_rx", "tx_usb_queue voll, Reset-Befehl verworfen (#%" PRIu32 ")",
+                                         tx_queue_reset_timeout_count);
                             }
 
-                            ESP_LOGI("usb_rx", "GRBL Fehler erkannt: %s", line_buf);
+                            ESP_LOGD("usb_rx", "GRBL Fehler erkannt: %s", line_buf);
 
                             // Optional: kleinen Delay einfügen, damit GRBL Reset verarbeitet
                             vTaskDelay(pdMS_TO_TICKS(50));
@@ -432,8 +523,8 @@ void process_usb_rx_task(void *pvParameters)
                         grbl_config_add_line(&raw_cfg, line_buf);
                         apply_grbl_max_feed(&raw_cfg);
 
-                        ESP_LOGI("usb_rx", "GRBL $-Zeile empfangen: %s", line_buf);
-                        ESP_LOGI("grbl", "FeedMax: X=%.3f", machine_max_feed_rate);
+                        ESP_LOGD("usb_rx", "GRBL $-Zeile empfangen: %s", line_buf);
+                        ESP_LOGD("grbl", "FeedMax: X=%.3f", machine_max_feed_rate);
                     }
 
                     // --------------------------
@@ -460,7 +551,7 @@ static void usb_close_device(void)
 
 static void recover_usb_link(const char *context, esp_err_t err)
 {
-    ESP_LOGW("usb_recovery", "%s: %s", context, esp_err_to_name(err));
+    ESP_LOGD("usb_recovery", "%s: %s", context, esp_err_to_name(err));
 
     stop_jogging();
     if (tx_usb_queue)
@@ -479,15 +570,12 @@ static void queue2grbl(void *arg)
 
     while (true)
     {
-        vTaskDelay(pdMS_TO_TICKS(10));
-
-        // STOP bytes mit höherer Priorität (nicht blockierend prüfen)
         if (xQueueReceive(control_queue, &ctrl, 0) == pdPASS)
         {
             if (cdc_dev)
             {
                 xSemaphoreTake(usb_tx_lock, portMAX_DELAY);
-                esp_err_t err = cdc_acm_host_data_tx_blocking(cdc_dev, &ctrl, 1, 1000);
+                esp_err_t err = cdc_acm_host_data_tx_blocking(cdc_dev, &ctrl, 1, 100);
                 xSemaphoreGive(usb_tx_lock);
                 if (err != ESP_OK)
                 {
@@ -495,13 +583,12 @@ static void queue2grbl(void *arg)
                     continue;
                 }
             }
-            ESP_LOGI("queue2grbl", "STOP sofort gesendet");
+            ESP_LOGD("queue2grbl", "STOP gesendet");
             xQueueReset(tx_usb_queue);
             continue;
         }
 
-        // Warte auf ein tx-Item
-        if (xQueueReceive(tx_usb_queue, &item, pdMS_TO_TICKS(10)) != pdPASS)
+        if (xQueueReceive(tx_usb_queue, &item, pdMS_TO_TICKS(5)) != pdPASS)
             continue;
 
         size_t len = item.len;
@@ -511,12 +598,21 @@ static void queue2grbl(void *arg)
         if (!cdc_dev)
             continue;
 
+        if (xQueueReceive(control_queue, &ctrl, 0) == pdPASS)
+        {
+            xSemaphoreTake(usb_tx_lock, portMAX_DELAY);
+            cdc_acm_host_data_tx_blocking(cdc_dev, &ctrl, 1, 100);
+            xSemaphoreGive(usb_tx_lock);
+            xQueueReset(tx_usb_queue);
+            continue;
+        }
+
         xSemaphoreTake(usb_tx_lock, portMAX_DELAY);
 
         char tmp[MAX_LINE_LENGTH + 1];
         memcpy(tmp, item.data, item.len);
         tmp[item.len] = 0;
-        ESP_LOGI("queue2grbl", "%s", tmp);
+        ESP_LOGD("queue2grbl", "%s", tmp);
 
         esp_err_t err = cdc_acm_host_data_tx_blocking(cdc_dev, (uint8_t *)item.data, item.len, 1000);
         xSemaphoreGive(usb_tx_lock);
@@ -536,7 +632,7 @@ static void handle_event(const cdc_acm_host_dev_event_data_t *event, void *user_
         recover_usb_link("CDC-ACM error", ESP_FAIL);
         break;
     case CDC_ACM_HOST_DEVICE_DISCONNECTED:
-        ESP_LOGI("handle_event", "Device suddenly disconnected");
+        ESP_LOGD("handle_event", "Device suddenly disconnected");
         if (cdc_dev == event->data.cdc_hdl)
         {
             cdc_acm_host_close(event->data.cdc_hdl);
@@ -547,6 +643,7 @@ static void handle_event(const cdc_acm_host_dev_event_data_t *event, void *user_
             cdc_acm_host_close(event->data.cdc_hdl);
         }
         stop_jogging();
+        grbl_config_done = false;
         if (tx_usb_queue)
             xQueueReset(tx_usb_queue);
         if (rx_usb_queue)
@@ -554,11 +651,11 @@ static void handle_event(const cdc_acm_host_dev_event_data_t *event, void *user_
         xSemaphoreGive(device_disconnected_sem);
         break;
     case CDC_ACM_HOST_SERIAL_STATE:
-        // ESP_LOGI("handle_event", "Serial state notif 0x%04X", event->data.serial_state.val);
+        // ESP_LOGD("handle_event", "Serial state notif 0x%04X", event->data.serial_state.val);
         break;
     case CDC_ACM_HOST_NETWORK_CONNECTION:
     default:
-        ESP_LOGW("handle_event", "Unsupported CDC event: %i", event->type);
+        ESP_LOGD("handle_event", "Unsupported CDC event: %i", event->type);
         break;
     }
 }
@@ -589,6 +686,8 @@ void adc_init(adc_channel_t *channel, uint8_t numChannels)
 {
     adc_oneshot_unit_init_cfg_t unitConfig = {
         .unit_id = ADC_UNIT,
+        .clk_src = (adc_oneshot_clk_src_t)0, // 0 = Treiber-Default
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
     };
     adc_oneshot_new_unit(&unitConfig, &adc_handle);
 
@@ -604,19 +703,177 @@ void adc_init(adc_channel_t *channel, uint8_t numChannels)
 
 }
 //*************************************************************************************
+static void calibrate_joystick_center(void)
+{
+    ESP_LOGD("joy", "Kalibriere Nullpunkt — Joystick in Mittelstellung lassen...");
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    int64_t sum[2] = {0, 0};
+    int min_adc[2] = {4095, 4095};
+    int max_adc[2] = {0, 0};
+
+    for (int i = 0; i < JOYSTICK_CENTER_SAMPLES; i++)
+    {
+        adc_oneshot_read(adc_handle, channels[0], &adc_raw[0]);
+        adc_oneshot_read(adc_handle, channels[1], &adc_raw[1]);
+        sum[0] += adc_raw[0];
+        sum[1] += adc_raw[1];
+        if (adc_raw[0] < min_adc[0])
+            min_adc[0] = adc_raw[0];
+        if (adc_raw[0] > max_adc[0])
+            max_adc[0] = adc_raw[0];
+        if (adc_raw[1] < min_adc[1])
+            min_adc[1] = adc_raw[1];
+        if (adc_raw[1] > max_adc[1])
+            max_adc[1] = adc_raw[1];
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    joystick_center_adc[0] = (int)(sum[0] / JOYSTICK_CENTER_SAMPLES);
+    joystick_center_adc[1] = (int)(sum[1] / JOYSTICK_CENTER_SAMPLES);
+    adc_filtered[0] = joystick_center_adc[0];
+    adc_filtered[1] = joystick_center_adc[1];
+    for (int axis = 0; axis < 2; axis++)
+    {
+        joystick_range_adc_pos[axis] = JOYSTICK_ADC_HALF_RANGE;
+        joystick_range_adc_neg[axis] = JOYSTICK_ADC_HALF_RANGE;
+    }
+
+    for (int axis = 0; axis < 2; axis++)
+    {
+        int spread = (max_adc[axis] - min_adc[axis]) / 2 + JOYSTICK_NOISE_MARGIN;
+        if (spread < JOYSTICK_NOISE_MARGIN)
+            spread = JOYSTICK_NOISE_MARGIN;
+        if (spread > 45)
+            spread = 45;
+        if (axis == 0)
+            spread += JOYSTICK_X_NOISE_EXTRA;
+        joystick_noise_adc[axis] = spread;
+    }
+
+    joystick_calibrated = true;
+
+    ESP_LOGD("joy", "Nullpunkt ADC X=%d Y=%d, Rausch X=%d Y=%d, Range +X=%d -X=%d +Y=%d -Y=%d",
+             joystick_center_adc[0], joystick_center_adc[1],
+             joystick_noise_adc[0], joystick_noise_adc[1],
+             joystick_range_adc_pos[0], joystick_range_adc_neg[0],
+             joystick_range_adc_pos[1], joystick_range_adc_neg[1]);
+}
+
+static int adc_abs_delta(int axis)
+{
+    int delta = adc_filtered[axis] - joystick_center_adc[axis];
+    return delta > 0 ? delta : -delta;
+}
+
+static bool adc_axis_idle(int axis)
+{
+    return adc_abs_delta(axis) <= joystick_noise_adc[axis] + JOYSTICK_ADC_IDLE_MARGIN;
+}
+
+static bool adc_axis_start(int axis)
+{
+    return adc_abs_delta(axis) > joystick_noise_adc[axis] + JOYSTICK_ADC_START_EXTRA;
+}
+
+static bool joystick_fully_idle(void)
+{
+    return adc_axis_idle(0) && adc_axis_idle(1);
+}
+
+static bool joystick_start_intent(void)
+{
+    return adc_axis_start(0) || adc_axis_start(1);
+}
+
+static void track_joystick_center_idle(int *idle_samples)
+{
+    if (!joystick_fully_idle())
+    {
+        *idle_samples = 0;
+        return;
+    }
+
+    (*idle_samples)++;
+    if (*idle_samples < JOYSTICK_CENTER_TRACK_SAMPLES)
+        return;
+
+    joystick_center_adc[0] = (joystick_center_adc[0] * 31 + adc_filtered[0]) / 32;
+    joystick_center_adc[1] = (joystick_center_adc[1] * 31 + adc_filtered[1]) / 32;
+    *idle_samples = JOYSTICK_CENTER_TRACK_SAMPLES;
+}
+
+static void learn_joystick_travel(int filtered, int center, int axis)
+{
+    int delta = filtered - center;
+    if (delta == 0)
+        return;
+
+    int abs_delta = (delta > 0) ? delta : -delta;
+    if (abs_delta < JOYSTICK_TRAVEL_LEARN_MIN)
+        return;
+
+    int learned = (abs_delta * 11) / 10;
+    if (learned > 2200)
+        return;
+
+    if (delta > 0)
+    {
+        if (learned > joystick_range_adc_pos[axis])
+            joystick_range_adc_pos[axis] = learned;
+    }
+    else if (learned > joystick_range_adc_neg[axis])
+    {
+        joystick_range_adc_neg[axis] = learned;
+    }
+}
+
+static int adc_to_axis(int filtered, int center, int axis)
+{
+    int delta = filtered - center;
+    int abs_delta = delta > 0 ? delta : -delta;
+    if (abs_delta <= joystick_noise_adc[axis])
+        return 0;
+
+    learn_joystick_travel(filtered, center, axis);
+
+    int range = (delta > 0) ? joystick_range_adc_pos[axis] : joystick_range_adc_neg[axis];
+    if (range <= 0)
+        range = JOYSTICK_ADC_HALF_RANGE;
+
+    delta = (delta * 100) / range;
+    if (delta > 100)
+        delta = 100;
+    if (delta < -100)
+        delta = -100;
+    return delta;
+}
+
 static void adc_read(void)
 {
-    adc_oneshot_read(adc_handle, channels[0], &adc_raw[0]);
-    adc_oneshot_read(adc_handle, channels[1], &adc_raw[1]);
+    int raw[2];
 
-    x = map(adc_raw[0], 0, 4095, -100, 100);
-    y = map(adc_raw[1], 0, 4095, -100, 100);
+    adc_oneshot_read(adc_handle, channels[0], &raw[0]);
+    adc_oneshot_read(adc_handle, channels[1], &raw[1]);
+
+    adc_filtered[0] = (adc_filtered[0] * 3 + raw[0]) / 4;
+    adc_filtered[1] = (adc_filtered[1] * 3 + raw[1]) / 4;
+
+    if (!joystick_calibrated)
+    {
+        x = 0;
+        y = 0;
+        return;
+    }
+
+    x = adc_to_axis(adc_filtered[0], joystick_center_adc[0], 0);
+    y = adc_to_axis(adc_filtered[1], joystick_center_adc[1], 1);
 }
 //******************************************************************************************
 // USB Connected Callback
 static bool on_usb_connected(void)
 {
-    ESP_LOGI("usb", "Starte GRBL Config Abfrage");
+    ESP_LOGD("usb", "Starte GRBL Config Abfrage");
 
     grbl_config_active = true;
     grbl_config_done = false;
@@ -627,7 +884,7 @@ static bool on_usb_connected(void)
     esp_err_t err = cdc_acm_host_data_tx_blocking(cdc_dev, (uint8_t *)"$$\n", 3, 1000);
     if (err != ESP_OK)
     {
-        ESP_LOGW("on_usb_connected", "Sendefehler $$: %s", esp_err_to_name(err));
+        ESP_LOGD("on_usb_connected", "Sendefehler $$: %s", esp_err_to_name(err));
         grbl_config_active = false;
         return false;
     }
@@ -642,145 +899,222 @@ static bool on_usb_connected(void)
 
     if (!grbl_config_done)
     {
-        ESP_LOGW("grbl", "GRBL Konfiguration TIMEOUT");
+        ESP_LOGD("grbl", "GRBL Konfiguration TIMEOUT");
         grbl_config_active = false;
         return false;
     }
 
     apply_grbl_max_feed(&raw_cfg);
 
-    ESP_LOGI("grbl", "Konfiguration erfolgreich geladen");
-    ESP_LOGI("grbl", "FeedMax X=%.3f", machine_max_feed_rate);
+    ESP_LOGD("grbl", "Konfiguration erfolgreich geladen");
+    ESP_LOGD("grbl", "FeedMax X=%.3f", machine_max_feed_rate);
     return true;
 }
 //******************************************************************************************
 // Joystick Normalisierung & Quantisierung
 static void configure_joy(void)
 {
-    joystick.xHardwareReversed = true;
-    joystick.yHardwareReversed = false;
+    joystick.xHardwareReversed = false;
+    joystick.yHardwareReversed = true;
 
     machine_max_feed_rate = JOYSTICK_DEFAULT_MAX_FEED;
+    reset_motion_smoothing();
+    calibrate_joystick_center();
     adc_read();
 }
 //******************************************************************************************
-// --- 10-Stufen Quantisierung
-static float quantize_10(int v)
+// Totzone abziehen und Restbereich 0..100 neu skalieren (kein Sprung an der Totzone)
+static int axis_after_deadzone(int v)
 {
-    if (v > -JOYSTICK_DEADZONE && v < JOYSTICK_DEADZONE)
+    if (v > -JOYSTICK_DEADZONE_STOP && v < JOYSTICK_DEADZONE_STOP)
+        return 0;
+
+    int sign = (v > 0) ? 1 : -1;
+    int abs_v = (v > 0) ? v : -v;
+    int remapped = (abs_v - JOYSTICK_DEADZONE_STOP) * 100 / (100 - JOYSTICK_DEADZONE_STOP);
+    if (remapped > 100)
+        remapped = 100;
+    return sign * remapped;
+}
+
+// Exponentielle Kennlinie: kleine Ausschläge → deutlich langsamere Bewegung
+static float apply_response_curve(float norm)
+{
+    if (norm == 0.0f)
         return 0.0f;
 
-    // in 10 Bereiche pro Seite teilen
-    // -100..100 -> -10..+10
-    int q = v / 10; // integer Abtastung
-    if (q > 10)
-        q = 10;
-    if (q < -10)
-        q = -10;
+    float sign = (norm > 0.0f) ? 1.0f : -1.0f;
+    float magnitude = powf(fabsf(norm), JOYSTICK_RESPONSE_EXPONENT);
+    return sign * magnitude;
+}
 
-    return (float)q / 10.0f; // zurück nach -1..+1
+// IIR-Glättung der Bewegungsachsen (weniger Ruckeln bei feinen Korrekturen)
+static float smooth_motion_axis(float target, float *state)
+{
+    if (fabsf(target) < 0.001f)
+    {
+        *state *= (1.0f - JOYSTICK_MOTION_SMOOTH_ALPHA);
+        if (fabsf(*state) < 0.001f)
+            *state = 0.0f;
+        return *state;
+    }
+
+    *state = *state * (1.0f - JOYSTICK_MOTION_SMOOTH_ALPHA) + target * JOYSTICK_MOTION_SMOOTH_ALPHA;
+    return *state;
+}
+
+static void read_joystick_axes(int *lx, int *ly)
+{
+    adc_read();
+    *lx = joystick.xHardwareReversed ? -x : x;
+    *ly = joystick.yHardwareReversed ? -y : y;
+}
+
+static bool joystick_motion_axes(int lx, int ly, float *sx, float *sy)
+{
+    int mx = axis_after_deadzone(lx);
+    int my = axis_after_deadzone(ly);
+
+    if (mx != 0 && !adc_axis_start(0))
+        mx = 0;
+    if (my != 0 && !adc_axis_start(1))
+        my = 0;
+
+    float tx = apply_response_curve((float)mx / 100.0f);
+    float ty = apply_response_curve((float)my / 100.0f);
+
+    *sx = smooth_motion_axis(tx, &motion_smooth_x);
+    *sy = smooth_motion_axis(ty, &motion_smooth_y);
+    return fabsf(*sx) > 0.001f || fabsf(*sy) > 0.001f;
 }
 //******************************************************************************************
 // Joystick Task
 static void joy_task(void *arg)
 {
-    // --- Konfiguration ---
-    const TickType_t JOG_INTERVAL = pdMS_TO_TICKS(10); // 10 ms
-    const TickType_t ADC_INTERVAL = pdMS_TO_TICKS(50); // ADC alle 50 ms
-    const float STEP_RES = JOYSTICK_STEP_MM;
-
-    float send_x = 0;
-    float send_y = 0;
-    float F = 0;
+    const TickType_t JOG_INTERVAL = pdMS_TO_TICKS(10);
+    const float LOOKAHEAD = JOG_LOOKAHEAD_SEGMENTS;
 
     TickType_t last_wake = xTaskGetTickCount();
-    TickType_t last_adc_time = 0;
-
-    int lx = 0, ly = 0;
+    const float interval_s = (float)JOG_INTERVAL / (float)configTICK_RATE_HZ;
+    int start_confirm = 0;
+    int idle_track_samples = 0;
 
     while (true)
     {
         vTaskDelayUntil(&last_wake, JOG_INTERVAL);
 
-        TickType_t now = xTaskGetTickCount();
+        int lx = 0;
+        int ly = 0;
+        read_joystick_axes(&lx, &ly);
+        track_joystick_center_idle(&idle_track_samples);
 
-        // --- ADC lesen ---
-        if ((now - last_adc_time) >= ADC_INTERVAL)
+        if (cdc_dev == NULL)
         {
-            adc_read();
-            last_adc_time = now;
-
-            lx = joystick.xHardwareReversed ? -x : x;
-            ly = joystick.yHardwareReversed ? -y : y;
-        }
-
-        // --- Quantisierung 10 Stufen ---
-        float sx = quantize_10(lx);
-        float sy = quantize_10(ly);
-
-        // --- Deadzone ---
-        if (sx == 0.0f && sy == 0.0f)
-        {
+            start_confirm = 0;
+            idle_track_samples = 0;
             if (is_jogging_now)
-            {
                 stop_jogging();
-                uint8_t stop = GRBL_STOP_CMD;
-                xQueueReset(tx_usb_queue);
-                xQueueSend(control_queue, &stop, 0);
-            }
             continue;
         }
 
-        // --- Achsgeschwindigkeit (mm/s) ---
+        if (joystick_fully_idle())
+        {
+            start_confirm = 0;
+            if (is_jogging_now)
+                abort_jog_motion();
+            continue;
+        }
+
+        if (!is_jogging_now)
+        {
+            if (!joystick_start_intent())
+            {
+                start_confirm = 0;
+                continue;
+            }
+            start_confirm++;
+            if (start_confirm < JOYSTICK_START_SAMPLES)
+                continue;
+        }
+
+        float sx = 0.0f;
+        float sy = 0.0f;
+        if (!joystick_motion_axes(lx, ly, &sx, &sy))
+        {
+            if (is_jogging_now)
+                abort_jog_motion();
+            continue;
+        }
+
         float max_mm_s = machine_max_feed_rate / 60.0f;
         float vx = sx * max_mm_s;
         float vy = sy * max_mm_s;
 
-        float interval_s = (float)JOG_INTERVAL * (float)portTICK_PERIOD_MS / 1000.0f;
+        float cmd_x = vx * interval_s * LOOKAHEAD;
+        float cmd_y = vy * interval_s * LOOKAHEAD;
 
-        // --- Schritte pro Intervall (ganzzahlig, STEP_RES) ---
-        send_x = roundf((vx * interval_s) / STEP_RES) * STEP_RES;
-        send_y = roundf((vy * interval_s) / STEP_RES) * STEP_RES;
+        if (fabsf(cmd_x) < JOG_MIN_STEP_MM && fabsf(cmd_y) < JOG_MIN_STEP_MM)
+            continue;
 
-        // --- Feedrate berechnen ---
-        float Fx = (fabsf(send_x) / interval_s) * 60.0f;
-        float Fy = (fabsf(send_y) / interval_s) * 60.0f;
-        F = fmaxf(Fx, Fy);
-
+        float F = fmaxf(fabsf(vx), fabsf(vy)) * 60.0f;
+        if (F < JOYSTICK_MIN_FEEDRATE)
+            continue;
         if (F > machine_max_feed_rate)
             F = machine_max_feed_rate;
-
-        if (F < JOYSTICK_MIN_FEEDRATE)
-            F = JOYSTICK_MIN_FEEDRATE;
 
         start_jogging();
         if (!next_jog_true)
             continue;
 
-        // --- SENDEN ---
-        if (xSemaphoreTake(ok_sem, (TickType_t)100) == pdTRUE &&
-            next_jog_true && is_jogging_now)
+        if (xSemaphoreTake(ok_sem, (TickType_t)100) != pdTRUE)
+            continue;
+        if (!next_jog_true || !is_jogging_now)
         {
-            // längere Schritte erzeugen, um Lookahead auszunutzen
-            // z.B. min. 1 mm pro Befehl, multipliziert durch Achsstufe
-            float cmd_x = send_x;
-            float cmd_y = send_y;
+            xSemaphoreGive(ok_sem);
+            continue;
+        }
 
-            if (fabsf(cmd_x) < STEP_RES)
-                cmd_x = (cmd_x > 0) ? STEP_RES : (cmd_x < 0 ? -STEP_RES : 0);
-            if (fabsf(cmd_y) < STEP_RES)
-                cmd_y = (cmd_y > 0) ? STEP_RES : (cmd_y < 0 ? -STEP_RES : 0);
+        read_joystick_axes(&lx, &ly);
+        if (!joystick_motion_axes(lx, ly, &sx, &sy))
+        {
+            xSemaphoreGive(ok_sem);
+            abort_jog_motion();
+            continue;
+        }
 
-            char cmd[128];
-            int n = snprintf(cmd, sizeof(cmd),
-                             "$J=G91 X%.3f Y%.3f F%.0f\n",
-                             cmd_x, cmd_y, F);
+        vx = sx * max_mm_s;
+        vy = sy * max_mm_s;
+        cmd_x = vx * interval_s * LOOKAHEAD;
+        cmd_y = vy * interval_s * LOOKAHEAD;
+        if (fabsf(cmd_x) < JOG_MIN_STEP_MM && fabsf(cmd_y) < JOG_MIN_STEP_MM)
+        {
+            xSemaphoreGive(ok_sem);
+            continue;
+        }
+        F = fmaxf(fabsf(vx), fabsf(vy)) * 60.0f;
+        if (F < JOYSTICK_MIN_FEEDRATE)
+        {
+            xSemaphoreGive(ok_sem);
+            continue;
+        }
+        if (F > machine_max_feed_rate)
+            F = machine_max_feed_rate;
 
-            tx_item_t item;
-            item.len = n;
-            memcpy(item.data, cmd, n);
+        char cmd[128];
+        int n = snprintf(cmd, sizeof(cmd),
+                         "$J=G91 X%.3f Y%.3f F%.0f\n",
+                         cmd_x, cmd_y, F);
 
-            xQueueSend(tx_usb_queue, &item, 0);
+        tx_item_t item;
+        item.len = n;
+        memcpy(item.data, cmd, n);
+
+        if (xQueueSend(tx_usb_queue, &item, 0) != pdPASS)
+        {
+            tx_queue_jog_drop_count++;
+            ESP_LOGW("joy_task", "tx_usb_queue voll, Jog verworfen (#%" PRIu32 ")", tx_queue_jog_drop_count);
+            xSemaphoreGive(ok_sem);
+            continue;
         }
     }
 }
@@ -791,20 +1125,20 @@ static void usb_connect_loop(void *arg)
     const cdc_acm_host_device_config_t dev_cfg = {
         .connection_timeout_ms = 5000,
         .out_buffer_size = USB_MAX_CHUNK,
-        .in_buffer_size = 64,
+        .in_buffer_size = USB_CDC_IN_BUFFER_SIZE,
         .event_cb = handle_event,
         .data_cb = handle_usb_rx,
         .user_arg = NULL};
 
     while (true)
     {
-        ESP_LOGI("usb_connect_loop", "Versuche USB-Gerät zu öffnen...");
+        ESP_LOGD("usb_connect_loop", "Versuche USB-Gerät zu öffnen...");
         esp_err_t err = cdc_acm_host_open(USB_TARGET_VID, USB_TARGET_PID, 0, &dev_cfg, &cdc_dev);
 
         if (err != ESP_OK)
         {
             // Gerät nicht da, warten und erneut versuchen
-            ESP_LOGI("usb_connect_loop", "Kein Gerät, retry in 500ms");
+            ESP_LOGD("usb_connect_loop", "Kein Gerät, retry in 500ms");
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
@@ -819,12 +1153,12 @@ static void usb_connect_loop(void *arg)
         line_coding.bCharFormat = 0;
         ESP_ERROR_CHECK(cdc_acm_host_line_coding_set(cdc_dev, &line_coding));
         ESP_ERROR_CHECK(cdc_acm_host_line_coding_get(cdc_dev, &line_coding));
-        ESP_LOGI("usb_connect_loop", "Line Get: Rate: %"PRIu32", Stop bits: %"PRIu8", Parity: %"PRIu8", Databits: %"PRIu8"",
+        ESP_LOGD("usb_connect_loop", "Line Get: Rate: %" PRIu32 ", Stop bits: %" PRIu8 ", Parity: %" PRIu8 ", Databits: %" PRIu8 "",
                  line_coding.dwDTERate, line_coding.bCharFormat, line_coding.bParityType, line_coding.bDataBits);
 
         ESP_ERROR_CHECK(cdc_acm_host_set_control_line_state(cdc_dev, true, false));
 
-        ESP_LOGI("usb_connect_loop", "USB-Gerät verbunden");
+        ESP_LOGD("usb_connect_loop", "USB-Gerät verbunden");
         led_set_color(0, 0, 255); // Blau = Gerät verbunden
 
         if (!on_usb_connected())
@@ -844,10 +1178,11 @@ static void usb_connect_loop(void *arg)
         // Warte bis Gerät getrennt wird
         xSemaphoreTake(device_disconnected_sem, portMAX_DELAY);
         stop_jogging();
+        grbl_config_done = false;
         if (tx_usb_queue)
             xQueueReset(tx_usb_queue);
         led_set_color(255, 0, 0); // Rot = Gerät getrennt
-        ESP_LOGW("usb_connect_loop", "USB-Gerät getrennt — Reconnect in 500ms");
+        ESP_LOGD("usb_connect_loop", "USB-Gerät getrennt — Reconnect in 500ms");
         cdc_dev = NULL;
         vTaskDelay(pdMS_TO_TICKS(500));
     }
@@ -886,7 +1221,15 @@ extern "C" void app_main()
     // USB Host Init
     const usb_host_config_t host_config = {
         .skip_phy_setup = false,
+        .root_port_unpowered = false,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
+        .enum_filter_cb = NULL,
+        .fifo_settings_custom = {
+            .nptx_fifo_lines = 0,
+            .ptx_fifo_lines = 0,
+            .rx_fifo_lines = 0,
+        },
+        .peripheral_map = 0,
     };
     ESP_ERROR_CHECK(usb_host_install(&host_config));
     ESP_ERROR_CHECK(cdc_acm_host_install(NULL));
@@ -896,7 +1239,7 @@ extern "C" void app_main()
     xTaskCreate(usb_connect_loop, "usb_connect_loop", 4096, nullptr, 10, nullptr);
     xTaskCreate(usb_host_task, "usb_host_task", 4096, NULL, 20, NULL);
     xTaskCreate(uart_event_task, "uart_event_task", 8192, NULL, 10, NULL);
-    xTaskCreate(process_usb_rx_task, "process_usb_rx_task", 4096, NULL, 10, NULL);
+    xTaskCreate(process_usb_rx_task, "process_usb_rx_task", 4096, NULL, 12, NULL);
     xTaskCreate(queue2grbl, "queue2grbl", 8192, NULL, 10, NULL);
     xTaskCreate(joy_task, "joy_task", 4096, NULL, 10, NULL);
 

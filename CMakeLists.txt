@@ -8,3 +8,15 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
 idf_build_set_property(MINIMAL_BUILD ON)
 project(grbl-joy)
+
+# Strip known GCC-only flags from compile_commands.json so clangd does not report
+# drv_unknown_argument errors (e.g. -fno-tree-switch-conversion) on ESP-IDF headers.
+if(EXISTS "${CMAKE_SOURCE_DIR}/fix_compile_commands.py")
+    add_custom_target(
+        fix_clangd ALL
+        COMMAND ${CMAKE_COMMAND} -E echo "Running fix_compile_commands.py..."
+        COMMAND ${CMAKE_COMMAND} -E env python ${CMAKE_SOURCE_DIR}/fix_compile_commands.py
+        COMMENT "Cleaning compile_commands.json for clangd"
+        VERBATIM
+    )
+endif()

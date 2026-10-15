@@ -1,5 +1,17 @@
 CompileFlags:
   CompilationDatabase: build
+  # Drop only GCC-specific flags clang/clangd cannot parse (do not use -f* / -m* wildcards).
+  Remove:
+    - -fno-tree-switch-conversion
+    - -fno-shrink-wrap
+    - -fstrict-volatile-bitfields
+    - -mtext-section-literals
+    - -mlongcalls
   Add:
-    - -D__XTENSA__=1
-  Remove: [-f*, -m*]
+    - -Wno-visibility
+    - --target=xtensa-esp-elf
+
+Diagnostics:
+  Suppress:
+    - drv_unknown_argument
+    - visibility

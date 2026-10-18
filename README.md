@@ -176,15 +176,15 @@ idf.py flash monitor
 | Start hysteresis | ADC noise + 55 counts | `JOYSTICK_ADC_START_EXTRA` |
 | Stop hysteresis | ADC noise + 6 counts | `JOYSTICK_ADC_IDLE_MARGIN` |
 | Start confirmation | 4 × 10 ms | `JOYSTICK_START_SAMPLES` |
-| Min. jog step | 0.008 mm | `JOG_MIN_STEP_MM` |
-| Lookahead factor | 2.0 segments | `JOG_LOOKAHEAD_SEGMENTS` |
+| Min. jog step | 0.004 mm | `JOG_MIN_STEP_MM` |
+| Lookahead factor | 2.5 segments | `JOG_LOOKAHEAD_SEGMENTS` |
 | Min. feed rate | 1 mm/min | `JOYSTICK_MIN_FEEDRATE` |
 | Max. feed rate | from GRBL `$110`, fallback 4000 | `JOYSTICK_DEFAULT_MAX_FEED` |
 | Jog / ADC interval | 10 ms | `JOG_INTERVAL` in `joy_task()` |
 | Center calibration | 64 samples at boot | `JOYSTICK_CENTER_SAMPLES` |
 | Center drift correction | after ~400 ms idle | `JOYSTICK_CENTER_TRACK_SAMPLES` |
 
-Jog commands use `$J=G91 X.. Y.. F..` with step size and feed rate derived from joystick deflection and `$110`. Each command is sent only after GRBL responds with `ok` (`ok_sem`).
+Jog commands use `$J=G91 X.. Y.. F..` with step size and feed rate derived from joystick deflection and `$110`. Each command is sent only after GRBL responds with `ok` (`ok_sem`). Only `ok` replies to commands this firmware sent (`$J`, `$X`) are withheld from the host.
 
 Axis inversion in `configure_joy()`: `joystick.xHardwareReversed`, `joystick.yHardwareReversed`.
 
@@ -196,8 +196,8 @@ Axis inversion in `configure_joy()`: `joystick.xHardwareReversed`, `joystick.yHa
 | `usb_connect_loop()` | USB connect, line coding, GRBL config, reconnect |
 | `usb_host_task()` | USB host event loop |
 | `uart_event_task()` | UART0 → TX queue (host → GRBL) |
-| `process_usb_rx_task()` | Parse USB RX, filter jog/errors, forward to UART0 |
-| `queue2grbl()` | Send TX queue and stop bytes to GRBL |
+| `process_usb_rx_task()` | Parse USB RX, handle faults and own `ok` replies, forward to UART0 |
+| `queue2grbl()` | Send TX queue; realtime bytes go out first |
 | `joy_task()` | Read joystick, generate proportional jog commands |
 | `calibrate_joystick_center()` | Measure center and noise at startup |
 | `on_usb_connected()` | Send `$$` and load GRBL settings |
@@ -213,6 +213,7 @@ Axis inversion in `configure_joy()`: `joystick.xHardwareReversed`, `joystick.yHa
 - On USB TX failure, CDC error, or disconnect: stop jogging, clear queues, close the device, reconnect after 500 ms.
 - Logs go to UART1 (115200 baud), not UART0 — UART0 is reserved for the host bridge.
 - TX queue backpressure: host data waits on `tx_usb_queue`; overflow counters are logged as warnings (`tx_queue_*`, `uart_rx_overflow_count`).
+- Host realtime bytes (`!`, `?`, `~`, Ctrl-X, feed/rapid/spindle/coolant overrides) are sent before queued G-code. Only jog cancel (`0x85`) clears the TX queue.
 - For sustained high host throughput, enable `UART0_FLOW_CONTROL` (see above).
 
 ## License

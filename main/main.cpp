@@ -15,8 +15,9 @@
 
 #include "led_control.hpp"
 
-#include "esp_timer.h"
 #include "esp_adc/adc_oneshot.h"
+
+#include <atomic>
 
 // UART-Konfiguration
 #define UART_NUM UART_NUM_0
@@ -55,8 +56,12 @@
 #define RX_QUEUE_LENGTH 128
 #define RX_ITEM_SIZE 128
 
-// USB CDC Device Handle
+// USB CDC Device Handle. Schließen nur über claim_cdc_for_close(), damit
+// Disconnect und TX-Fehler dasselbe Handle nicht zweimal schließen.
 cdc_acm_dev_hdl_t cdc_dev = NULL;
+static cdc_acm_dev_hdl_t cdc_claimed = NULL;
+static portMUX_TYPE cdc_dev_mux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool usb_in_host_callback = false;
 
 // Struktur für empfangene UART/USB-Pakete
 typedef struct
@@ -97,9 +102,11 @@ static int adc_raw[2];
 // --- Stop-Befehl definieren ---
 #define GRBL_STOP_CMD 0x85
 static bool is_jogging_now = false;
-static bool filter_jog_ok = false;
 static bool next_jog_true = false;
-static int64_t jog_filter_until_us = 0; // Zeitmarke in µs
+// Anzahl noch ausstehender ok auf Befehle, die diese Firmware selbst gesendet hat.
+static std::atomic<int> local_ok_pending{0};
+// Nach Jog-Cancel wegen ALARM/ERROR einmal $X hinterher, erst wenn 0x85 raus ist.
+static std::atomic<bool> unlock_after_jog_cancel{false};
 
 int x = 0, y = 0;
 static int joystick_center_adc[2];
@@ -146,14 +153,15 @@ typedef struct
 {
     char data[MAX_LINE_LENGTH];
     size_t len;
+    bool expect_ok; // true: die ok-Antwort bleibt beim Host unsichtbar
 } tx_item_t;
 
 static QueueHandle_t tx_usb_queue = NULL;
 static QueueHandle_t control_queue; // für Stop/Notfall-Bytes
 
-#define CONTROL_QUEUE_LENGTH 8
+#define CONTROL_QUEUE_LENGTH 32
 
-static volatile uint32_t tx_queue_host_timeout_count;
+static volatile uint32_t ctrl_queue_drop_count;
 static volatile uint32_t tx_queue_jog_drop_count;
 static volatile uint32_t tx_queue_reset_timeout_count;
 static volatile uint32_t rx_usb_queue_drop_count;
@@ -163,43 +171,28 @@ static volatile uint32_t uart_rx_overflow_count;
 // Joystick Start/Stop Funktionen
 static inline void start_jogging(void)
 {
-    // setze Flags atomar-ish (volatile reicht für einfache usage)
     is_jogging_now = true;
-    filter_jog_ok = false; // keine Filterung während aktivem Jogging
     next_jog_true = true;
 }
 static inline void stop_jogging(void)
 {
     is_jogging_now = false;
+    // false lassen: joy_task verwirft einen Jog, der den Stopp im ok-Warten überholt hat.
     next_jog_true = false;
     xSemaphoreTake(ok_sem, 0);
-    const int FILTER_MS = 1000;
-    jog_filter_until_us = esp_timer_get_time() + (int64_t)FILTER_MS * 1000LL;
-    filter_jog_ok = true;
-    next_jog_true = true;
+    xSemaphoreGive(ok_sem);
 }
 
 static void send_jog_cancel(void)
 {
     xQueueReset(tx_usb_queue);
-    xSemaphoreTake(ok_sem, 0);
 
     uint8_t stop = GRBL_STOP_CMD;
-    if (cdc_dev == NULL)
+    if (xQueueSend(control_queue, &stop, pdMS_TO_TICKS(TX_QUEUE_SEND_TIMEOUT_MS)) != pdPASS)
     {
-        xQueueSend(control_queue, &stop, 0);
-        xSemaphoreGive(ok_sem);
-        return;
+        ctrl_queue_drop_count++;
+        ESP_LOGW("jog", "control_queue voll, Jog-Cancel verworfen (#%" PRIu32 ")", ctrl_queue_drop_count);
     }
-
-    xSemaphoreTake(usb_tx_lock, portMAX_DELAY);
-    esp_err_t err = cdc_acm_host_data_tx_blocking(cdc_dev, &stop, 1, 100);
-    xSemaphoreGive(usb_tx_lock);
-
-    if (err != ESP_OK)
-        xQueueSend(control_queue, &stop, 0);
-
-    xSemaphoreGive(ok_sem);
 }
 
 static inline void reset_motion_smoothing(void)
@@ -314,6 +307,72 @@ static void uart_init()
         ESP_LOGE("uart_init", "uart_queue == NULL after driver install!");
     }
 }
+// GRBL-Echtzeitbytes: sofort raus, nicht hinter G-Code in der TX-Queue.
+static bool is_grbl_realtime(uint8_t b)
+{
+    switch (b)
+    {
+    case 0x18: // Ctrl-X Soft-Reset
+    case '!':
+    case '?':
+    case '~':
+    case 0x84: // Safety Door
+    case 0x85: // Jog Cancel
+    case 0x86: // Debug-Report, nur wenn GRBL mit DEBUG gebaut ist
+        return true;
+    default:
+        break;
+    }
+    if (b >= 0x90 && b <= 0x94) // Feed-Override
+        return true;
+    if (b >= 0x95 && b <= 0x97) // Rapid-Override
+        return true;
+    if (b >= 0x99 && b <= 0x9E) // Spindle-Override
+        return true;
+    if (b == 0xA0 || b == 0xA1) // Coolant
+        return true;
+    return false;
+}
+
+static void enqueue_realtime(uint8_t b)
+{
+    if (xQueueSend(control_queue, &b, pdMS_TO_TICKS(TX_QUEUE_SEND_TIMEOUT_MS)) != pdPASS)
+    {
+        ctrl_queue_drop_count++;
+        ESP_LOGW("uart_event_task", "control_queue voll, Echtzeit 0x%02X verworfen (#%" PRIu32 ")",
+                 b, ctrl_queue_drop_count);
+    }
+}
+
+static void enqueue_host_chunk(const uint8_t *data, size_t len)
+{
+    // Echtzeitbytes zuerst, damit ein voller TX-Puffer Feed-Hold nicht aufhält.
+    for (size_t i = 0; i < len; i++)
+    {
+        if (is_grbl_realtime(data[i]))
+            enqueue_realtime(data[i]);
+    }
+
+    size_t i = 0;
+    while (i < len)
+    {
+        if (is_grbl_realtime(data[i]))
+        {
+            i++;
+            continue;
+        }
+
+        tx_item_t item = {};
+        while (i < len && item.len < sizeof(item.data) && !is_grbl_realtime(data[i]))
+            item.data[item.len++] = (char)data[i++];
+
+        if (item.len == 0)
+            continue;
+        if (xQueueSend(tx_usb_queue, &item, portMAX_DELAY) != pdPASS)
+            ESP_LOGE("uart_event_task", "tx_usb_queue nicht verfügbar");
+    }
+}
+
 //*************************************************************************************
 // UART Event Task
 static void uart_event_task(void *pvParameters)
@@ -324,28 +383,40 @@ static void uart_event_task(void *pvParameters)
     {
         if (xQueueReceive(rx_uart_queue, (void *)&event, (TickType_t)portMAX_DELAY))
         {
-            // bzero(dtmp, UART_BUF_SIZE);
-
             switch (event.type)
             {
             case UART_DATA:
             {
                 ESP_LOGD("uart_event_task", "[UART DATA]: %d", event.size);
-                tx_item_t item;
-
-                size_t to_read = event.size;
-                if (to_read > sizeof(item.data))
-                    to_read = sizeof(item.data);
-
-                int r = uart_read_bytes(UART_NUM, (uint8_t *)item.data, to_read, portMAX_DELAY);
-                if (r > 0)
+                // Erst den ganzen Event lesen. Sonst bleibt der Rest im Treiber,
+                // und Echtzeitbytes am Ende warten hinter einem vollen TX-Puffer.
+                size_t remaining = event.size;
+                uint8_t chunk[UART_HOST_BUF_SIZE];
+                size_t filled = 0;
+                while (remaining > 0 && filled < sizeof(chunk))
                 {
-                    item.len = (size_t)r;
-                    if (xQueueSend(tx_usb_queue, &item, portMAX_DELAY) != pdPASS)
-                    {
-                        tx_queue_host_timeout_count++;
-                        ESP_LOGW("uart_event_task", "tx_usb_queue blockiert — Host-Daten verworfen");
-                    }
+                    size_t to_read = remaining;
+                    if (to_read > sizeof(chunk) - filled)
+                        to_read = sizeof(chunk) - filled;
+
+                    int r = uart_read_bytes(UART_NUM, chunk + filled, to_read, portMAX_DELAY);
+                    if (r <= 0)
+                        break;
+                    filled += (size_t)r;
+                    remaining -= (size_t)r;
+                }
+                if (filled > 0)
+                    enqueue_host_chunk(chunk, filled);
+                while (remaining > 0)
+                {
+                    size_t to_read = remaining;
+                    if (to_read > sizeof(chunk))
+                        to_read = sizeof(chunk);
+                    int r = uart_read_bytes(UART_NUM, chunk, to_read, portMAX_DELAY);
+                    if (r <= 0)
+                        break;
+                    remaining -= (size_t)r;
+                    enqueue_host_chunk(chunk, (size_t)r);
                 }
                 break;
             }
@@ -404,6 +475,45 @@ static bool handle_usb_rx(const uint8_t *data, size_t len, void *arg)
     return true;
 }
 
+static bool line_is_grbl_ok(const char *line)
+{
+    return line[0] == 'o' && line[1] == 'k' &&
+           (line[2] == '\r' || line[2] == '\n' || line[2] == '\0');
+}
+
+static bool line_is_grbl_fault(const char *line)
+{
+    return strstr(line, "ALARM:") || strstr(line, "alarm:") ||
+           strstr(line, "ERROR:") || strstr(line, "error:");
+}
+
+// true: dieses ok gehört zu $J/$X von uns und geht nicht an den Host.
+static bool take_local_ok(void)
+{
+    int prev = local_ok_pending.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev > 0)
+        return true;
+    local_ok_pending.store(0, std::memory_order_release);
+    return false;
+}
+
+static void queue_expect_ok(const char *cmd)
+{
+    tx_item_t item = {};
+    size_t n = strlen(cmd);
+    if (n > sizeof(item.data))
+        n = sizeof(item.data);
+    memcpy(item.data, cmd, n);
+    item.len = n;
+    item.expect_ok = true;
+    if (xQueueSend(tx_usb_queue, &item, pdMS_TO_TICKS(TX_QUEUE_SEND_TIMEOUT_MS)) != pdPASS)
+    {
+        tx_queue_reset_timeout_count++;
+        ESP_LOGW("usb_rx", "tx_usb_queue voll, Befehl verworfen (#%" PRIu32 ")",
+                 tx_queue_reset_timeout_count);
+    }
+}
+
 //*************************************************************************************
 void process_usb_rx_task(void *pvParameters)
 {
@@ -427,42 +537,21 @@ void process_usb_rx_task(void *pvParameters)
                 if (c == '\n')
                 {
                     line_buf[line_len] = '\0';
-                    bool is_ok = strstr(line_buf, "ok") != NULL;
-                    int64_t now = esp_timer_get_time();
+                    bool is_ok = line_is_grbl_ok(line_buf);
 
                     // --------------------------
-                    // 0) Fehlerprüfung (ALARM/ERROR)
+                    // 0) Fehlerprüfung (ALARM/ERROR) während Jog
                     // --------------------------
-                    if (is_jogging_now)
+                    if (is_jogging_now && line_is_grbl_fault(line_buf))
                     {
-                        if (strstr(line_buf, "ALARM:") || strstr(line_buf, "ERROR:"))
-                        {
-                            stop_jogging();
-                            send_jog_cancel();
+                        // $X erst in send_control_byte, nach dem Queue-Reset von 0x85.
+                        unlock_after_jog_cancel.store(true, std::memory_order_release);
+                        abort_jog_motion();
+                        ESP_LOGW("usb_rx", "GRBL Fehler erkannt: %s", line_buf);
 
-                            // GRBL Reset senden ($X) nach kurzer Verzögerung
-                            vTaskDelay(pdMS_TO_TICKS(50));
-                            tx_item_t reset_item;
-                            const char *reset_cmd = "$X\n";
-                            reset_item.len = strlen(reset_cmd);
-                            memcpy(reset_item.data, reset_cmd, reset_item.len);
-                            if (xQueueSend(tx_usb_queue, &reset_item,
-                                           pdMS_TO_TICKS(TX_QUEUE_SEND_TIMEOUT_MS)) != pdPASS)
-                            {
-                                tx_queue_reset_timeout_count++;
-                                ESP_LOGW("usb_rx", "tx_usb_queue voll, Reset-Befehl verworfen (#%" PRIu32 ")",
-                                         tx_queue_reset_timeout_count);
-                            }
-
-                            ESP_LOGD("usb_rx", "GRBL Fehler erkannt: %s", line_buf);
-
-                            // Optional: kleinen Delay einfügen, damit GRBL Reset verarbeitet
-                            vTaskDelay(pdMS_TO_TICKS(50));
-
-                            uart_write_bytes(UART_NUM, line_buf, line_len);
-                            line_len = 0;
-                            continue; // nächste Zeile
-                        }
+                        uart_write_bytes(UART_NUM, line_buf, line_len);
+                        line_len = 0;
+                        continue;
                     }
 
                     // --------------------------
@@ -486,33 +575,13 @@ void process_usb_rx_task(void *pvParameters)
                         line_len = 0;
                         continue;
                     }
-                    // --------------------------
-                    // 2) Jog läuft aktuell
-                    // --------------------------
-                    if (is_jogging_now && is_ok)
+
+                    // ok nur schlucken, wenn es die Antwort auf $J oder $X von uns ist.
+                    if (is_ok && take_local_ok())
                     {
-                        xSemaphoreGive(ok_sem); // wichtig!
+                        xSemaphoreGive(ok_sem);
                         line_len = 0;
                         continue;
-                    }
-
-                    // --------------------------
-                    // 3) Jog wurde gerade gestoppt
-                    //    → alle ok ignorieren
-                    // --------------------------
-                    if (filter_jog_ok)
-                    {
-                        if (now < jog_filter_until_us && is_ok)
-                        {
-                            // IGNORIEREN
-                            line_len = 0;
-                            continue;
-                        }
-                        else
-                        {
-                            // Zeitfenster abgelaufen → deaktivieren
-                            filter_jog_ok = false;
-                        }
                     }
 
                     // --------------------------
@@ -538,27 +607,126 @@ void process_usb_rx_task(void *pvParameters)
     }
 }
 //******************************************************************************************
-static void usb_close_device(void)
+// Liefert das Handle genau einmal. hdl == NULL nimmt das aktuelle cdc_dev.
+static cdc_acm_dev_hdl_t claim_cdc_for_close(cdc_acm_dev_hdl_t hdl)
 {
-    xSemaphoreTake(usb_tx_lock, portMAX_DELAY);
-    if (cdc_dev)
+    portENTER_CRITICAL(&cdc_dev_mux);
+    if (hdl == NULL)
+        hdl = cdc_dev;
+
+    cdc_acm_dev_hdl_t claimed = NULL;
+    if (hdl != NULL && hdl != cdc_claimed)
     {
-        cdc_acm_host_close(cdc_dev);
+        claimed = hdl;
+        cdc_claimed = hdl;
+        if (cdc_dev == hdl)
+            cdc_dev = NULL;
+    }
+    else if (cdc_dev == hdl)
+    {
         cdc_dev = NULL;
     }
+    portEXIT_CRITICAL(&cdc_dev_mux);
+    return claimed;
+}
+
+static void usb_prepare_open(void)
+{
+    portENTER_CRITICAL(&cdc_dev_mux);
+    if (cdc_dev == NULL)
+        cdc_claimed = NULL;
+    portEXIT_CRITICAL(&cdc_dev_mux);
+}
+
+static bool usb_publish_opened(cdc_acm_dev_hdl_t dev)
+{
+    bool ok = false;
+    portENTER_CRITICAL(&cdc_dev_mux);
+    if (dev != NULL && cdc_claimed == dev)
+    {
+        cdc_dev = NULL;
+    }
+    else
+    {
+        cdc_dev = dev;
+        cdc_claimed = NULL;
+        ok = dev != NULL;
+    }
+    portEXIT_CRITICAL(&cdc_dev_mux);
+    return ok;
+}
+
+static void usb_close_handle(cdc_acm_dev_hdl_t hdl)
+{
+    bool locked = false;
+    if (!usb_in_host_callback && usb_tx_lock &&
+        xSemaphoreTake(usb_tx_lock, portMAX_DELAY) == pdTRUE)
+        locked = true;
+
+    cdc_acm_dev_hdl_t dev = claim_cdc_for_close(hdl);
+
+    if (locked && usb_tx_lock)
+        xSemaphoreGive(usb_tx_lock);
+
+    if (dev)
+        cdc_acm_host_close(dev);
+}
+
+static void usb_close_device(void)
+{
+    usb_close_handle(NULL);
+}
+
+static esp_err_t usb_tx(const uint8_t *data, size_t len, uint32_t timeout_ms)
+{
+    if (usb_tx_lock == NULL || xSemaphoreTake(usb_tx_lock, portMAX_DELAY) != pdTRUE)
+        return ESP_ERR_INVALID_STATE;
+
+    portENTER_CRITICAL(&cdc_dev_mux);
+    cdc_acm_dev_hdl_t dev = cdc_dev;
+    portEXIT_CRITICAL(&cdc_dev_mux);
+
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    if (dev)
+        err = cdc_acm_host_data_tx_blocking(dev, data, len, timeout_ms);
+
     xSemaphoreGive(usb_tx_lock);
+    return err;
 }
 
 static void recover_usb_link(const char *context, esp_err_t err)
 {
-    ESP_LOGD("usb_recovery", "%s: %s", context, esp_err_to_name(err));
+    ESP_LOGW("usb_recovery", "%s: %s", context, esp_err_to_name(err));
 
     stop_jogging();
+    local_ok_pending.store(0, std::memory_order_release);
+    unlock_after_jog_cancel.store(false, std::memory_order_release);
     if (tx_usb_queue)
         xQueueReset(tx_usb_queue);
 
     usb_close_device();
     xSemaphoreGive(device_disconnected_sem);
+}
+
+static bool send_control_byte(uint8_t ctrl)
+{
+    if (cdc_dev)
+    {
+        esp_err_t err = usb_tx(&ctrl, 1, 100);
+        if (err != ESP_OK)
+        {
+            recover_usb_link("CTRL send", err);
+            return false;
+        }
+    }
+    if (ctrl == GRBL_STOP_CMD && tx_usb_queue)
+        xQueueReset(tx_usb_queue);
+    if (ctrl == GRBL_STOP_CMD &&
+        unlock_after_jog_cancel.exchange(false, std::memory_order_acq_rel) &&
+        cdc_dev)
+        queue_expect_ok("$X\n");
+    ESP_LOGD("queue2grbl", "Echtzeit 0x%02X", ctrl);
+    return true;
 }
 
 //******************************************************************************************
@@ -572,59 +740,45 @@ static void queue2grbl(void *arg)
     {
         if (xQueueReceive(control_queue, &ctrl, 0) == pdPASS)
         {
-            if (cdc_dev)
-            {
-                xSemaphoreTake(usb_tx_lock, portMAX_DELAY);
-                esp_err_t err = cdc_acm_host_data_tx_blocking(cdc_dev, &ctrl, 1, 100);
-                xSemaphoreGive(usb_tx_lock);
-                if (err != ESP_OK)
-                {
-                    recover_usb_link("STOP send", err);
-                    continue;
-                }
-            }
-            ESP_LOGD("queue2grbl", "STOP gesendet");
-            xQueueReset(tx_usb_queue);
+            send_control_byte(ctrl);
             continue;
         }
 
         if (xQueueReceive(tx_usb_queue, &item, pdMS_TO_TICKS(5)) != pdPASS)
             continue;
 
-        size_t len = item.len;
-        if (len == 0)
-            continue;
-
-        if (!cdc_dev)
+        if (item.len == 0)
             continue;
 
         if (xQueueReceive(control_queue, &ctrl, 0) == pdPASS)
         {
-            xSemaphoreTake(usb_tx_lock, portMAX_DELAY);
-            cdc_acm_host_data_tx_blocking(cdc_dev, &ctrl, 1, 100);
-            xSemaphoreGive(usb_tx_lock);
-            xQueueReset(tx_usb_queue);
-            continue;
+            if (!send_control_byte(ctrl) || ctrl == GRBL_STOP_CMD)
+                continue;
         }
 
-        xSemaphoreTake(usb_tx_lock, portMAX_DELAY);
+        if (!cdc_dev)
+            continue;
 
-        char tmp[MAX_LINE_LENGTH + 1];
-        memcpy(tmp, item.data, item.len);
-        tmp[item.len] = 0;
-        ESP_LOGD("queue2grbl", "%s", tmp);
+        if (item.len < sizeof(item.data))
+        {
+            char tmp[MAX_LINE_LENGTH + 1];
+            memcpy(tmp, item.data, item.len);
+            tmp[item.len] = 0;
+            ESP_LOGD("queue2grbl", "%s", tmp);
+        }
 
-        esp_err_t err = cdc_acm_host_data_tx_blocking(cdc_dev, (uint8_t *)item.data, item.len, 1000);
-        xSemaphoreGive(usb_tx_lock);
-
+        esp_err_t err = usb_tx((uint8_t *)item.data, item.len, 1000);
         if (err != ESP_OK)
             recover_usb_link("TX send", err);
+        else if (item.expect_ok)
+            local_ok_pending.fetch_add(1, std::memory_order_release);
     }
 }
 //*************************************************************************************
 // USB Events
 static void handle_event(const cdc_acm_host_dev_event_data_t *event, void *user_ctx)
 {
+    usb_in_host_callback = true;
     switch (event->type)
     {
     case CDC_ACM_HOST_ERROR:
@@ -633,21 +787,15 @@ static void handle_event(const cdc_acm_host_dev_event_data_t *event, void *user_
         break;
     case CDC_ACM_HOST_DEVICE_DISCONNECTED:
         ESP_LOGD("handle_event", "Device suddenly disconnected");
-        if (cdc_dev == event->data.cdc_hdl)
-        {
-            cdc_acm_host_close(event->data.cdc_hdl);
-            cdc_dev = NULL;
-        }
-        else if (event->data.cdc_hdl)
-        {
-            cdc_acm_host_close(event->data.cdc_hdl);
-        }
         stop_jogging();
+        local_ok_pending.store(0, std::memory_order_release);
+        unlock_after_jog_cancel.store(false, std::memory_order_release);
         grbl_config_done = false;
         if (tx_usb_queue)
             xQueueReset(tx_usb_queue);
         if (rx_usb_queue)
             xQueueReset(rx_usb_queue);
+        usb_close_handle(event->data.cdc_hdl);
         xSemaphoreGive(device_disconnected_sem);
         break;
     case CDC_ACM_HOST_SERIAL_STATE:
@@ -658,6 +806,7 @@ static void handle_event(const cdc_acm_host_dev_event_data_t *event, void *user_
         ESP_LOGD("handle_event", "Unsupported CDC event: %i", event->type);
         break;
     }
+    usb_in_host_callback = false;
 }
 
 //*************************************************************************************
@@ -675,11 +824,6 @@ static void usb_host_task(void *arg)
     }
 }
 
-//*************************************************************************************
-int map(int x, int in_min, int in_max, int out_min, int out_max)
-{
-    return ((x - in_min) * (out_max - out_min)) / (in_max - in_min) + out_min;
-}
 //*************************************************************************************
 // ADC Initialisierung
 void adc_init(adc_channel_t *channel, uint8_t numChannels)
@@ -881,10 +1025,10 @@ static bool on_usb_connected(void)
     memset(&raw_cfg, 0, sizeof(raw_cfg)); // Buffer leeren
 
     // "$$" direkt senden
-    esp_err_t err = cdc_acm_host_data_tx_blocking(cdc_dev, (uint8_t *)"$$\n", 3, 1000);
+    esp_err_t err = usb_tx((const uint8_t *)"$$\n", 3, 1000);
     if (err != ESP_OK)
     {
-        ESP_LOGD("on_usb_connected", "Sendefehler $$: %s", esp_err_to_name(err));
+        ESP_LOGW("on_usb_connected", "Sendefehler $$: %s", esp_err_to_name(err));
         grbl_config_active = false;
         return false;
     }
@@ -899,7 +1043,7 @@ static bool on_usb_connected(void)
 
     if (!grbl_config_done)
     {
-        ESP_LOGD("grbl", "GRBL Konfiguration TIMEOUT");
+        ESP_LOGW("grbl", "GRBL Konfiguration TIMEOUT");
         grbl_config_active = false;
         return false;
     }
@@ -1105,9 +1249,16 @@ static void joy_task(void *arg)
                          "$J=G91 X%.3f Y%.3f F%.0f\n",
                          cmd_x, cmd_y, F);
 
-        tx_item_t item;
-        item.len = n;
-        memcpy(item.data, cmd, n);
+        if (n <= 0 || (size_t)n > MAX_LINE_LENGTH)
+        {
+            xSemaphoreGive(ok_sem);
+            continue;
+        }
+
+        tx_item_t item = {};
+        item.len = (size_t)n;
+        item.expect_ok = true;
+        memcpy(item.data, cmd, item.len);
 
         if (xQueueSend(tx_usb_queue, &item, 0) != pdPASS)
         {
@@ -1133,7 +1284,9 @@ static void usb_connect_loop(void *arg)
     while (true)
     {
         ESP_LOGD("usb_connect_loop", "Versuche USB-Gerät zu öffnen...");
-        esp_err_t err = cdc_acm_host_open(USB_TARGET_VID, USB_TARGET_PID, 0, &dev_cfg, &cdc_dev);
+        usb_prepare_open();
+        cdc_acm_dev_hdl_t opened = NULL;
+        esp_err_t err = cdc_acm_host_open(USB_TARGET_VID, USB_TARGET_PID, 0, &dev_cfg, &opened);
 
         if (err != ESP_OK)
         {
@@ -1142,8 +1295,14 @@ static void usb_connect_loop(void *arg)
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
+        if (!usb_publish_opened(opened))
+        {
+            ESP_LOGW("usb_connect_loop", "USB-Gerät direkt nach Open getrennt");
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
 
-        cdc_acm_host_desc_print(cdc_dev);
+        cdc_acm_host_desc_print(opened);
         vTaskDelay(pdMS_TO_TICKS(100));
 
         cdc_acm_line_coding_t line_coding;
@@ -1151,12 +1310,12 @@ static void usb_connect_loop(void *arg)
         line_coding.bDataBits = 8;
         line_coding.bParityType = 0;
         line_coding.bCharFormat = 0;
-        ESP_ERROR_CHECK(cdc_acm_host_line_coding_set(cdc_dev, &line_coding));
-        ESP_ERROR_CHECK(cdc_acm_host_line_coding_get(cdc_dev, &line_coding));
+        ESP_ERROR_CHECK(cdc_acm_host_line_coding_set(opened, &line_coding));
+        ESP_ERROR_CHECK(cdc_acm_host_line_coding_get(opened, &line_coding));
         ESP_LOGD("usb_connect_loop", "Line Get: Rate: %" PRIu32 ", Stop bits: %" PRIu8 ", Parity: %" PRIu8 ", Databits: %" PRIu8 "",
                  line_coding.dwDTERate, line_coding.bCharFormat, line_coding.bParityType, line_coding.bDataBits);
 
-        ESP_ERROR_CHECK(cdc_acm_host_set_control_line_state(cdc_dev, true, false));
+        ESP_ERROR_CHECK(cdc_acm_host_set_control_line_state(opened, true, false));
 
         ESP_LOGD("usb_connect_loop", "USB-Gerät verbunden");
         led_set_color(0, 0, 255); // Blau = Gerät verbunden
@@ -1170,20 +1329,28 @@ static void usb_connect_loop(void *arg)
         }
 
         // Control-Line-Reset für GRBL-Gerät
-        cdc_acm_host_set_control_line_state(cdc_dev, true, true);
+        cdc_acm_host_set_control_line_state(opened, true, true);
         vTaskDelay(pdMS_TO_TICKS(100));
-        cdc_acm_host_set_control_line_state(cdc_dev, true, false);
+        cdc_acm_host_set_control_line_state(opened, true, false);
         vTaskDelay(pdMS_TO_TICKS(500));
 
-        // Warte bis Gerät getrennt wird
-        xSemaphoreTake(device_disconnected_sem, portMAX_DELAY);
+        // Veraltete Disconnect-Signale verwerfen. Ein echtes Ereignis danach
+        // bleibt in der Semaphore bzw. an cdc_dev == NULL sichtbar.
+        while (xSemaphoreTake(device_disconnected_sem, 0) == pdTRUE)
+        {
+        }
+        if (cdc_dev != NULL)
+            xSemaphoreTake(device_disconnected_sem, portMAX_DELAY);
+
         stop_jogging();
+        local_ok_pending.store(0, std::memory_order_release);
+        unlock_after_jog_cancel.store(false, std::memory_order_release);
         grbl_config_done = false;
         if (tx_usb_queue)
             xQueueReset(tx_usb_queue);
         led_set_color(255, 0, 0); // Rot = Gerät getrennt
         ESP_LOGD("usb_connect_loop", "USB-Gerät getrennt — Reconnect in 500ms");
-        cdc_dev = NULL;
+        usb_close_device();
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
